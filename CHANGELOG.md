@@ -15,6 +15,16 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   PMT descriptor 0x59 identifies a subtitle service. Expose `dvb_subtitle`,
   service languages and five-byte composition-page / ancillary-page /
   subtitling-type extradata records.
+- Identify DTS audio carried as private PES (`stream_type` 0x06). A DVB
+  DTS_descriptor (tag 0x7B) or a registration descriptor `DTS1`/`DTS2`/
+  `DTS3` names it directly. Private PES with no codec-naming descriptor
+  (none, or only alignment / language / bitrate / STD / stream
+  identifier) is identified from its payload at open: up to 5 MB of
+  transport stream is read ahead until four DTS frames chain (ETSI TS
+  102 114 core and extension substream headers), taking sample rate and
+  channels from the core header. Streams still unidentified after 64 KiB
+  of payload are dropped as before and the rest renumbered; every PES
+  read during the probe is delivered by `next_packet` in order.
 
 ### Fixed
 

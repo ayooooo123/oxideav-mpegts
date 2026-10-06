@@ -375,16 +375,25 @@ impl MpegTsDemuxer {
         // Step 3: map PMT streams → CodecParameters → StreamInfo. PIDs
         // whose stream_type we don't have a CodecId for are silently
         // dropped (we won't open a reassembler for them and their PES
-        // bytes never reach the caller).
+        // bytes never reach the caller). Private PES that no descriptor
+        // names gets a provisional stream until its payload decides.
         let tb = TimeBase::new(1, 90_000);
         let mut streams: Vec<StreamInfo> = Vec::new();
+        let mut provisional: Vec<u32> = Vec::new();
         let mut pid_to_stream: HashMap<u16, u32> = HashMap::new();
         let mut reassemblers: HashMap<u16, PesReassembler> = HashMap::new();
         let mut pts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
         let mut dts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
         for pmt_stream in &pmt.streams {
+            let idx = streams.len() as u32;
             let mut params = match codec_params_for_pmt_stream(pmt_stream) {
                 Some(p) => p,
+                None if private_payload_decides(pmt_stream) => {
+                    provisional.push(idx);
+                    let mut p = CodecParameters::audio(CodecId::new("bin_data"));
+                    p.media_type = oxideav_core::MediaType::Data;
+                    p
+                }
                 None => continue,
             };
             // Lift the ES_info ISO_639_language_descriptor (tag 0x0A,
@@ -397,7 +406,6 @@ impl MpegTsDemuxer {
                     params = params.with_language(code);
                 }
             }
-            let idx = streams.len() as u32;
             streams.push(StreamInfo {
                 index: idx,
                 time_base: tb,
@@ -457,6 +465,16 @@ impl MpegTsDemuxer {
                 if s.duration.is_none() {
                     s.duration = Some(ticks);
                 }
+            }
+        }
+
+        if !provisional.is_empty() {
+            demuxer.identify_private_streams(&provisional)?;
+            if demuxer.streams.is_empty() {
+                return Err(CoreError::invalid(
+                    "mpegts: PMT advertised no supported streams (its private PES \
+                     carries no payload this demuxer identifies)",
+                ));
             }
         }
 
@@ -1222,17 +1240,20 @@ impl MpegTsDemuxer {
     }
 
     /// Pull one TS packet from the input and, if it's for a stream we
-    /// track, feed the per-PID reassembler. Returns the number of
-    /// `Packet`s pushed into `self.pending` by this call.
-    fn read_one_into_pending(&mut self) -> CoreResult<usize> {
-        let buf = match read_one_packet(
+    /// track, feed the per-PID reassembler; a completed PES lands in
+    /// `self.pending`. At the end of the input, flush the reassemblers
+    /// and return `false`.
+    fn pump(&mut self) -> CoreResult<bool> {
+        let Some(buf) = read_one_packet(
             &mut self.input,
             &mut self.putback,
             self.bytes_read,
             self.layout,
-        )? {
-            Some(b) => b,
-            None => return Ok(0),
+        )?
+        else {
+            self.eof_reached = true;
+            self.flush_reassemblers();
+            return Ok(false);
         };
         let pkt_offset = self.bytes_read;
         self.bytes_read += self.layout.packet_size as u64;
@@ -1240,23 +1261,93 @@ impl MpegTsDemuxer {
         // PCR recovery runs on the PCR_PID regardless of whether that
         // PID also carries an elementary stream we track.
         self.observe_pcr(&pkt, pkt_offset);
-        let stream_idx = match self.pid_to_stream.get(&pkt.pid).copied() {
-            Some(i) => i,
-            None => return Ok(0),
+        let Some(stream_idx) = self.pid_to_stream.get(&pkt.pid).copied() else {
+            return Ok(true);
         };
         let reassembler = self
             .reassemblers
             .get_mut(&pkt.pid)
             .expect("pid_to_stream and reassemblers are kept in sync");
-        let emitted = reassembler.feed(&pkt).map_err(map_ts_err)?;
-        let pushed = if let Some(pes) = emitted {
+        if let Some(pes) = reassembler.feed(&pkt).map_err(map_ts_err)? {
             let packet = self.finish_pes(pkt.pid, stream_idx, pes);
             self.pending.push_back(packet);
-            1
-        } else {
-            0
-        };
-        Ok(pushed)
+        }
+        Ok(true)
+    }
+
+    /// Decide the provisional private-PES streams from their payload:
+    /// read ahead, at most [`PRIVATE_PROBE_TS_BYTES`] of input, until
+    /// each one is identified or has shown [`PRIVATE_PROBE_PAYLOAD`]
+    /// bytes, then drop the unidentified ones and renumber the rest.
+    /// Every PES read stays queued for `next_packet`.
+    fn identify_private_streams(&mut self, provisional: &[u32]) -> CoreResult<()> {
+        let mut payload: HashMap<u32, Vec<u8>> =
+            provisional.iter().map(|&index| (index, Vec::new())).collect();
+        let mut decided: HashMap<u32, Option<CodecParameters>> = HashMap::new();
+        let start = self.bytes_read;
+        let mut examined = 0;
+        while decided.len() < provisional.len()
+            && !self.eof_reached
+            && self.bytes_read - start < PRIVATE_PROBE_TS_BYTES
+        {
+            self.pump()?;
+            while let Some(packet) = self.pending.get(examined) {
+                examined += 1;
+                let index = packet.stream_index;
+                if decided.contains_key(&index) {
+                    continue;
+                }
+                let Some(seen) = payload.get_mut(&index) else {
+                    continue;
+                };
+                seen.extend_from_slice(&packet.data);
+                if let Some(params) = identify_dts(seen) {
+                    decided.insert(index, Some(params));
+                } else if seen.len() >= PRIVATE_PROBE_PAYLOAD {
+                    decided.insert(index, None);
+                }
+            }
+        }
+
+        let mut remap: HashMap<u32, u32> = HashMap::new();
+        let mut kept = Vec::with_capacity(self.streams.len());
+        for mut info in std::mem::take(&mut self.streams) {
+            let old = info.index;
+            if provisional.contains(&old) {
+                let Some(Some(mut params)) = decided.remove(&old) else {
+                    continue;
+                };
+                params.language = info.params.language.take();
+                info.params = params;
+            }
+            info.index = kept.len() as u32;
+            remap.insert(old, info.index);
+            kept.push(info);
+        }
+        self.streams = kept;
+        let dropped: Vec<u16> = self
+            .pid_to_stream
+            .iter()
+            .filter(|(_, index)| !remap.contains_key(index))
+            .map(|(&pid, _)| pid)
+            .collect();
+        for pid in dropped {
+            self.pid_to_stream.remove(&pid);
+            self.reassemblers.remove(&pid);
+            self.pts_trackers.remove(&pid);
+            self.dts_trackers.remove(&pid);
+        }
+        for index in self.pid_to_stream.values_mut() {
+            *index = remap[index];
+        }
+        self.pending.retain_mut(|packet| match remap.get(&packet.stream_index) {
+            Some(&index) => {
+                packet.stream_index = index;
+                true
+            }
+            None => false,
+        });
+        Ok(())
     }
 
     /// Flush every per-PID reassembler — used once the input runs
@@ -1316,47 +1407,7 @@ impl Demuxer for MpegTsDemuxer {
             if self.eof_reached {
                 return Err(CoreError::Eof);
             }
-            let pushed = self.read_one_into_pending()?;
-            if pushed == 0 {
-                // Check eof directly: read_one_packet returns Ok(None)
-                // when there are no more 188-byte chunks. We need a
-                // signal here without re-reading; do a single
-                // try-read and on `None` set eof + flush.
-                match read_one_packet(
-                    &mut self.input,
-                    &mut self.putback,
-                    self.bytes_read,
-                    self.layout,
-                )? {
-                    None => {
-                        self.eof_reached = true;
-                        self.flush_reassemblers();
-                    }
-                    Some(buf) => {
-                        let pkt_offset = self.bytes_read;
-                        self.bytes_read += self.layout.packet_size as u64;
-                        // We've already advanced past an EOF earlier
-                        // when this branch was taken with pushed=0 but
-                        // there ARE more bytes — that means the prior
-                        // packet was a non-stream PID (silently
-                        // dropped). Re-parse + feed and loop.
-                        let pkt = TsPacket::parse(&buf).map_err(map_ts_err)?;
-                        self.observe_pcr(&pkt, pkt_offset);
-                        if let Some(stream_idx) = self.pid_to_stream.get(&pkt.pid).copied() {
-                            let emitted = self
-                                .reassemblers
-                                .get_mut(&pkt.pid)
-                                .and_then(|r| r.feed(&pkt).transpose())
-                                .transpose()
-                                .map_err(map_ts_err)?;
-                            if let Some(pes) = emitted {
-                                let packet = self.finish_pes(pkt.pid, stream_idx, pes);
-                                self.pending.push_back(packet);
-                            }
-                        }
-                    }
-                }
-            }
+            self.pump()?;
         }
     }
 }
@@ -1619,30 +1670,150 @@ fn first_iso639_language(pmt_stream: &crate::PmtStream) -> Option<String> {
 /// Private PES has no codec identity without its PMT descriptors. DVB
 /// subtitle services use tag 0x59; keep every service's page identifiers
 /// in the decoder's five-byte (composition, ancillary, type) records.
+/// DTS audio is named by the DVB DTS_descriptor (tag 0x7B, ETSI EN 300
+/// 468 annex G) or a registration descriptor with one of the SMPTE-RA
+/// format identifiers `DTS1`/`DTS2`/`DTS3` (512/1024/2048-sample frames).
 fn codec_params_for_pmt_stream(stream: &crate::PmtStream) -> Option<CodecParameters> {
     if stream.stream_type != 0x06 {
         return codec_params_for_stream_type(stream.stream_type);
     }
     for descriptor in stream.iter_descriptors().flatten() {
-        if let crate::DescriptorBody::Subtitling(subtitles) = descriptor.body {
-            if subtitles.entries.is_empty() {
-                continue;
-            }
-            let mut params = CodecParameters::subtitle(CodecId::new("dvb_subtitle"));
-            params.extradata.reserve(subtitles.entries.len() * 5);
-            let mut languages = String::with_capacity(subtitles.entries.len() * 4 - 1);
-            for entry in subtitles.entries {
-                if !languages.is_empty() {
-                    languages.push(',');
+        match descriptor.body {
+            crate::DescriptorBody::Subtitling(subtitles) => {
+                if subtitles.entries.is_empty() {
+                    continue;
                 }
-                for byte in entry.language_code {
-                    languages.push(char::from(byte));
+                let mut params = CodecParameters::subtitle(CodecId::new("dvb_subtitle"));
+                params.extradata.reserve(subtitles.entries.len() * 5);
+                let mut languages = String::with_capacity(subtitles.entries.len() * 4 - 1);
+                for entry in subtitles.entries {
+                    if !languages.is_empty() {
+                        languages.push(',');
+                    }
+                    for byte in entry.language_code {
+                        languages.push(char::from(byte));
+                    }
+                    params.extradata.extend_from_slice(&entry.composition_page_id.to_be_bytes());
+                    params.extradata.extend_from_slice(&entry.ancillary_page_id.to_be_bytes());
+                    params.extradata.push(entry.subtitling_type);
                 }
-                params.extradata.extend_from_slice(&entry.composition_page_id.to_be_bytes());
-                params.extradata.extend_from_slice(&entry.ancillary_page_id.to_be_bytes());
-                params.extradata.push(entry.subtitling_type);
+                params.language = Some(languages);
+                return Some(params);
             }
-            params.language = Some(languages);
+            crate::DescriptorBody::Dts(_)
+            | crate::DescriptorBody::Registration {
+                format_identifier: [b'D', b'T', b'S', b'1'..=b'3'],
+                ..
+            } => return Some(CodecParameters::audio(CodecId::new("dts"))),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Private PES (`stream_type` 0x06) whose ES_info descriptors name no
+/// codec — none at all, or only the informational ones (data stream
+/// alignment 0x06, ISO 639 language 0x0A, maximum bitrate 0x0E, STD
+/// 0x11, DVB stream identifier 0x52) — is identified from its payload at
+/// open, as FFmpeg probes such streams. Streams with any other
+/// descriptor (teletext, VBI, AC-3, ...) are not, so opening never
+/// reads ahead for payload no probe here recognises.
+fn private_payload_decides(stream: &crate::PmtStream) -> bool {
+    stream.stream_type == 0x06
+        && codec_params_for_pmt_stream(stream).is_none()
+        && stream
+            .iter_descriptors()
+            .all(|d| d.is_ok_and(|d| matches!(d.tag, 0x06 | 0x0A | 0x0E | 0x11 | 0x52)))
+}
+
+/// Transport-stream bytes read at open while identifying private PES
+/// streams from their payload (FFmpeg's default probe size).
+const PRIVATE_PROBE_TS_BYTES: u64 = 5_000_000;
+
+/// Payload bytes of one private PES stream examined before it is
+/// dropped as unidentified.
+const PRIVATE_PROBE_PAYLOAD: usize = 64 * 1024;
+
+/// Frames that must chain, each starting exactly where the previous one
+/// ends, before a private payload counts as DTS.
+const DTS_PROBE_FRAMES: usize = 4;
+
+/// A DTS Coherent Acoustics core frame header (ETSI TS 102 114 §5.3.1)
+/// at the start of `b`: the frame's byte length and, where the header
+/// names them, its sample rate and channel count.
+fn dts_core_frame(b: &[u8]) -> Option<(usize, Option<u32>, Option<u16>)> {
+    if b.len() < 12 || b[..4] != [0x7F, 0xFE, 0x80, 0x01] {
+        return None;
+    }
+    let v = u64::from_be_bytes(b[4..12].try_into().ok()?);
+    let field = |shift: u32, bits: u32| ((v >> shift) & ((1 << bits) - 1)) as usize;
+    let deficit = field(58, 5); // SHORT: 31 in a normal frame
+    let nblks = field(50, 7); // PCM sample blocks - 1
+    let fsize = field(36, 14); // frame bytes - 1
+    let amode = field(30, 6);
+    let sfreq = field(26, 4);
+    let reserved = field(20, 1);
+    let lff = field(9, 2);
+    if deficit != 31 || nblks < 5 || fsize < 95 || reserved != 0 || lff == 3 {
+        return None;
+    }
+    // Table 5-5 (core audio sampling frequency).
+    const SFREQ: [u32; 16] = [0, 8000, 16000, 32000, 0, 0, 11025, 22050, 44100, 0, 0, 12000, 24000, 48000, 0, 0];
+    if SFREQ[sfreq] == 0 {
+        return None;
+    }
+    // Table 5-4 (audio channel arrangement); 10 and up are user defined.
+    const AMODE: [u16; 10] = [1, 2, 2, 2, 2, 3, 3, 4, 4, 5];
+    let channels = AMODE.get(amode).map(|c| c + u16::from(lff != 0));
+    Some((fsize + 1, Some(SFREQ[sfreq]), channels))
+}
+
+/// The byte length of a DTS-HD extension substream frame (ETSI TS 102
+/// 114 §7.4.1) at the start of `b`.
+fn dts_substream_frame(b: &[u8]) -> Option<usize> {
+    if b.len() < 13 || b[..4] != [0x64, 0x58, 0x20, 0x25] {
+        return None;
+    }
+    // After the user-defined byte: nExtSSIndex (2), bHeaderSizeType (1),
+    // then 8 + 16 or 12 + 20 bits of header and frame size, minus one.
+    let v = u64::from_be_bytes(b[5..13].try_into().ok()?);
+    let (header, frame) = if (v >> 61) & 1 == 0 {
+        (((v >> 53) & 0xFF) + 1, ((v >> 37) & 0xFFFF) + 1)
+    } else {
+        (((v >> 49) & 0xFFF) + 1, ((v >> 29) & 0xF_FFFF) + 1)
+    };
+    (header >= 16 && frame >= header).then_some(frame as usize)
+}
+
+/// [`DTS_PROBE_FRAMES`] DTS frames chain somewhere in `payload`: core
+/// frames (each optionally followed by its extension substream) or
+/// extension substreams alone. Returns the stream's parameters from the
+/// first core header.
+fn identify_dts(payload: &[u8]) -> Option<CodecParameters> {
+    for start in 0..payload.len() {
+        let mut pos = start;
+        let mut frames = 0;
+        let mut layout = None;
+        while frames < DTS_PROBE_FRAMES {
+            let rest = payload.get(pos..).unwrap_or(&[]);
+            if let Some((len, rate, channels)) = dts_core_frame(rest) {
+                layout.get_or_insert((rate, channels));
+                pos += len;
+                pos += payload.get(pos..).and_then(dts_substream_frame).unwrap_or(0);
+            } else if let Some(len) = dts_substream_frame(rest) {
+                pos += len;
+            } else {
+                break;
+            }
+            frames += 1;
+        }
+        // The last frame only has to start in the payload.
+        if frames == DTS_PROBE_FRAMES {
+            let mut params = CodecParameters::audio(CodecId::new("dts"));
+            if let Some((rate, channels)) = layout {
+                params.sample_rate = rate;
+                params.channels = channels;
+            }
             return Some(params);
         }
     }
@@ -3093,5 +3264,123 @@ mod tests {
         // span = 180_000 × 300 + 150 = 54_000_150 ticks.
         // micros = 54_000_150 × 1_000_000 / 27_000_000 = 2_000_005.
         assert_eq!(dmx.duration_micros(), Some(2_000_005));
+    }
+
+    /// A DTS core frame of `len` bytes (ETSI TS 102 114 §5.3.1): normal
+    /// frame, 16 PCM blocks, 3/2 channels plus LFE at 48 kHz; `fill`
+    /// pads the audio data.
+    fn dts_core_frame_bytes(len: usize, fill: u8) -> Vec<u8> {
+        let v: u64 = (1 << 63)
+            | (31 << 58)
+            | (15 << 50)
+            | (((len - 1) as u64) << 36)
+            | (9 << 30)
+            | (13 << 26)
+            | (15 << 21)
+            | (1 << 9);
+        let mut frame = vec![0x7F, 0xFE, 0x80, 0x01];
+        frame.extend_from_slice(&v.to_be_bytes());
+        frame.resize(len, fill);
+        frame
+    }
+
+    /// PAT + a PMT (program 1 on PID 0x100) listing `streams` as
+    /// `(stream_type, pid, ES_info descriptors)`.
+    fn pat_pmt_with(streams: &[(u8, u16, &[u8])]) -> Vec<u8> {
+        let mut bytes = synth_minimal_ts();
+        bytes.truncate(TS_PACKET_LEN);
+        let mut entries = Vec::new();
+        for &(stream_type, pid, descriptors) in streams {
+            entries.push(stream_type);
+            entries.extend_from_slice(&(0xE000 | pid).to_be_bytes());
+            entries.extend_from_slice(&(0xF000 | descriptors.len() as u16).to_be_bytes());
+            entries.extend_from_slice(descriptors);
+        }
+        let section_length = 9 + entries.len() + 4;
+        let mut pmt = vec![
+            0x02,
+            0xb0 | (section_length >> 8) as u8,
+            section_length as u8,
+            0, 1, 0xc1, 0, 0,
+            0xe1, 0x01, // PCR PID 0x101
+            0xf0, 0,
+        ];
+        pmt.extend_from_slice(&entries);
+        pmt.extend_from_slice(&crc32_mpeg2(&pmt).to_be_bytes());
+        for packet in ts_packets_for_section(0x100, &pmt, 0) {
+            bytes.extend_from_slice(&packet);
+        }
+        bytes
+    }
+
+    /// One private-stream-1 PES per payload on `pid`, 3600 ticks apart.
+    fn private_pes_packets(pid: u16, payloads: &[Vec<u8>], cc: &mut u8) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (i, payload) in payloads.iter().enumerate() {
+            let mut pes = pes_with_pts(90_000 + 3600 * i as u64, payload);
+            pes[3] = 0xbd;
+            for (k, chunk) in pes.chunks(184).enumerate() {
+                bytes.extend_from_slice(&ts_pes_ex(pid, *cc, k == 0, None, false, chunk));
+                *cc = (*cc + 1) & 0x0F;
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn private_pes_carrying_dts_frames_is_identified_from_its_payload() {
+        // FATE's dts/dts.ts: stream_type 0x06, no ES_info descriptors.
+        let frames: Vec<Vec<u8>> = (0..6).map(|i| dts_core_frame_bytes(400, i)).collect();
+        let mut bytes = pat_pmt_with(&[(0x06, 0x101, &[])]);
+        bytes.extend(private_pes_packets(0x101, &frames, &mut 0));
+        let mut demux = MpegTsDemuxer::new(Box::new(Cursor::new(bytes))).unwrap();
+        assert_eq!(demux.streams().len(), 1);
+        let stream = &demux.streams()[0];
+        assert_eq!(stream.params.codec_id.as_str(), "dts");
+        assert_eq!(stream.params.media_type, oxideav_core::MediaType::Audio);
+        assert_eq!(stream.params.sample_rate, Some(48_000));
+        assert_eq!(stream.params.channels, Some(6));
+        for (i, frame) in frames.iter().enumerate() {
+            let packet = demux.next_packet().unwrap();
+            assert_eq!(packet.stream_index, 0);
+            assert_eq!(packet.pts, Some(90_000 + 3600 * i as i64));
+            assert_eq!(&packet.data, frame, "PES {i} delivered intact after the probe");
+        }
+        assert!(matches!(demux.next_packet(), Err(CoreError::Eof)));
+    }
+
+    #[test]
+    fn private_pes_dts_registration_descriptor_names_the_codec() {
+        for descriptor in [&[0x05, 4, b'D', b'T', b'S', b'2'][..], &[0x7B, 5, 0, 0, 0, 0, 0][..]] {
+            let stream = crate::PmtStream { stream_type: 0x06, elementary_pid: 0x101, descriptors: descriptor.to_vec() };
+            assert_eq!(codec_params_for_pmt_stream(&stream).unwrap().codec_id.as_str(), "dts");
+        }
+    }
+
+    #[test]
+    fn unidentified_private_pes_is_dropped_and_the_rest_renumbered() {
+        // A private stream whose payload is no DTS (frames that do not
+        // chain) ahead of an H.264 stream in the PMT; teletext-tagged
+        // private PES is never probed.
+        let noise: Vec<Vec<u8>> = (0..400).map(|i| vec![(i % 251) as u8; 180]).collect();
+        let mut broken = dts_core_frame_bytes(400, 0);
+        broken.extend(dts_core_frame_bytes(300, 1)); // header says 300 bytes ...
+        broken.truncate(650); // ... but the next sync is not where it points
+        broken.extend(dts_core_frame_bytes(400, 2));
+        let mut bytes = pat_pmt_with(&[(0x06, 0x101, &[]), (0x1B, 0x102, &[]), (0x06, 0x103, &[0x56, 0])]);
+        let mut cc = 0;
+        bytes.extend(private_pes_packets(0x101, &[broken], &mut cc));
+        let mut pes = pes_with_pts(7777, b"h264 access unit");
+        pes[3] = 0xe0;
+        bytes.extend_from_slice(&ts_pes_ex(0x102, 0, true, None, false, &pes));
+        bytes.extend(private_pes_packets(0x101, &noise, &mut cc));
+        let mut demux = MpegTsDemuxer::new(Box::new(Cursor::new(bytes))).unwrap();
+        assert_eq!(demux.streams().len(), 1);
+        assert_eq!(demux.streams()[0].index, 0);
+        assert_eq!(demux.streams()[0].params.codec_id.as_str(), "h264");
+        let packet = demux.next_packet().unwrap();
+        assert_eq!((packet.stream_index, packet.pts), (0, Some(7777)));
+        assert_eq!(packet.data, b"h264 access unit");
+        assert!(matches!(demux.next_packet(), Err(CoreError::Eof)));
     }
 }
