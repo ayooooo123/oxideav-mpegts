@@ -383,7 +383,7 @@ impl MpegTsDemuxer {
         let mut pts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
         let mut dts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
         for pmt_stream in &pmt.streams {
-            let mut params = match codec_params_for_stream_type(pmt_stream.stream_type) {
+            let mut params = match codec_params_for_pmt_stream(pmt_stream) {
                 Some(p) => p,
                 None => continue,
             };
@@ -412,8 +412,8 @@ impl MpegTsDemuxer {
         }
         if streams.is_empty() {
             return Err(CoreError::invalid(
-                "mpegts: PMT advertised no streams we recognise (BD-relevant types: \
-                 0x02/0x1B/0x24/0xEA video, 0x80-0x86 audio, 0x90/0x92 subtitle)",
+                "mpegts: PMT advertised no supported streams (including private-PES \
+                 DVB subtitles identified by descriptor 0x59)",
             ));
         }
 
@@ -1616,6 +1616,39 @@ fn first_iso639_language(pmt_stream: &crate::PmtStream) -> Option<String> {
     None
 }
 
+/// Private PES has no codec identity without its PMT descriptors. DVB
+/// subtitle services use tag 0x59; keep every service's page identifiers
+/// in the decoder's five-byte (composition, ancillary, type) records.
+fn codec_params_for_pmt_stream(stream: &crate::PmtStream) -> Option<CodecParameters> {
+    if stream.stream_type != 0x06 {
+        return codec_params_for_stream_type(stream.stream_type);
+    }
+    for descriptor in stream.iter_descriptors().flatten() {
+        if let crate::DescriptorBody::Subtitling(subtitles) = descriptor.body {
+            if subtitles.entries.is_empty() {
+                continue;
+            }
+            let mut params = CodecParameters::subtitle(CodecId::new("dvb_subtitle"));
+            params.extradata.reserve(subtitles.entries.len() * 5);
+            let mut languages = String::with_capacity(subtitles.entries.len() * 4 - 1);
+            for entry in subtitles.entries {
+                if !languages.is_empty() {
+                    languages.push(',');
+                }
+                for byte in entry.language_code {
+                    languages.push(char::from(byte));
+                }
+                params.extradata.extend_from_slice(&entry.composition_page_id.to_be_bytes());
+                params.extradata.extend_from_slice(&entry.ancillary_page_id.to_be_bytes());
+                params.extradata.push(entry.subtitling_type);
+            }
+            params.language = Some(languages);
+            return Some(params);
+        }
+    }
+    None
+}
+
 /// Map an MPEG-TS `stream_type` byte to a [`CodecParameters`] the
 /// muxer registry understands. `None` means "drop this stream" —
 /// interactive graphics, DSM-CC sections, vendor-private codes, etc.
@@ -1703,6 +1736,74 @@ pub fn probe(p: &oxideav_core::ProbeData) -> oxideav_core::ProbeScore {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn private_pes_subtitling_descriptor_preserves_services() {
+        let stream = crate::PmtStream {
+            stream_type: 0x06,
+            elementary_pid: 0x101,
+            descriptors: vec![
+                0x59, 16,
+                b'e', b'n', b'g', 0x10, 0x12, 0x34, 0x56, 0x78,
+                b'f', b'r', b'a', 0x20, 0xab, 0xcd, 0xef, 0x01,
+            ],
+        };
+        let params = codec_params_for_pmt_stream(&stream).unwrap();
+        assert_eq!(params.codec_id.as_str(), "dvb_subtitle");
+        assert_eq!(params.media_type, oxideav_core::MediaType::Subtitle);
+        assert_eq!(params.language.as_deref(), Some("eng,fra"));
+        assert_eq!(params.extradata, [0x12, 0x34, 0x56, 0x78, 0x10, 0xab, 0xcd, 0xef, 0x01, 0x20]);
+    }
+
+    #[test]
+    fn private_pes_without_valid_subtitling_descriptor_is_not_dvb() {
+        for descriptors in [vec![], vec![0x59, 0], vec![0x59, 8, b'e'], vec![0x56, 0]] {
+            let stream = crate::PmtStream { stream_type: 0x06, elementary_pid: 0x101, descriptors };
+            assert!(codec_params_for_pmt_stream(&stream).is_none());
+        }
+        let stream = crate::PmtStream {
+            stream_type: 0x1b,
+            elementary_pid: 0x101,
+            descriptors: vec![0x59, 8, b'e', b'n', b'g', 0x10, 0, 1, 0, 2],
+        };
+        assert_eq!(codec_params_for_pmt_stream(&stream).unwrap().codec_id.as_str(), "h264");
+    }
+
+    #[test]
+    fn dvb_subtitle_pes_spanning_ts_packets_is_delivered_losslessly() {
+        let mut bytes = synth_minimal_ts();
+        bytes.truncate(TS_PACKET_LEN);
+        let mut pmt = vec![
+            0x02, 0xb0, 0x1c, 0, 1, 0xc1, 0, 0, 0xe1, 1, 0xf0, 0,
+            0x06, 0xe1, 1, 0xf0, 10,
+            0x59, 8, b'e', b'n', b'g', 0x10, 0, 1, 0, 2,
+        ];
+        pmt.extend_from_slice(&crc32_mpeg2(&pmt).to_be_bytes());
+        for packet in ts_packets_for_section(0x100, &pmt, 0) {
+            bytes.extend_from_slice(&packet);
+        }
+        // Preserve the full DVB PES data_identifier / stream_id prefix,
+        // all segment bytes, and the end-of-PES marker. TS stuffing is
+        // outside the declared PES length, not elementary-stream data.
+        let mut payload = vec![0x20, 0x00];
+        payload.extend((0..509).map(|i| (i % 251) as u8));
+        payload.push(0xff);
+        let mut pes = pes_with_pts(7_171_190_692, &payload);
+        pes[3] = 0xbd;
+        for (i, chunk) in pes.chunks(184).enumerate() {
+            bytes.extend_from_slice(&ts_pes_ex(0x101, i as u8, i == 0, None, false, chunk));
+        }
+        let mut demux = MpegTsDemuxer::new(Box::new(Cursor::new(bytes))).unwrap();
+        let stream = &demux.streams()[0];
+        assert_eq!(stream.params.codec_id.as_str(), "dvb_subtitle");
+        assert_eq!(stream.params.language.as_deref(), Some("eng"));
+        assert_eq!(stream.params.extradata, [0, 1, 0, 2, 0x10]);
+        assert_eq!(stream.time_base, TimeBase::new(1, 90_000));
+        let packet = demux.next_packet().unwrap();
+        assert_eq!(packet.pts, Some(7_171_190_692));
+        assert_eq!(packet.data, payload);
+        assert!(matches!(demux.next_packet(), Err(CoreError::Eof)));
+    }
 
     /// Build a minimal in-memory MPEG-TS byte stream with:
     /// * PAT pointing at PMT_PID = 0x100

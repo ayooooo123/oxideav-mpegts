@@ -417,7 +417,16 @@ impl PesPacket {
             return Err(TsError::BadPesStartCode([bytes[0], bytes[1], bytes[2]]));
         }
         let stream_id = bytes[3];
-        let _pes_packet_length = u16::from_be_bytes([bytes[4], bytes[5]]);
+        let pes_packet_length = usize::from(u16::from_be_bytes([bytes[4], bytes[5]]));
+        // A bounded PES ends after its declared body, even when the
+        // carrying TS packet has trailing payload stuffing. Retain the
+        // available prefix for callers inspecting an incomplete PES
+        // header while building seek indexes; a zero length is unbounded.
+        let bytes = if pes_packet_length == 0 {
+            bytes
+        } else {
+            &bytes[..bytes.len().min(6 + pes_packet_length)]
+        };
 
         if !has_optional_pes_header(stream_id) {
             return Ok(Self {

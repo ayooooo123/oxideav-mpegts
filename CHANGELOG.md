@@ -9,6 +9,19 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Recognize DVB subtitles in private PES (`stream_type` 0x06) only when
+  PMT descriptor 0x59 identifies a subtitle service. Expose `dvb_subtitle`,
+  service languages and five-byte composition-page / ancillary-page /
+  subtitling-type extradata records.
+
+### Fixed
+
+- Respect nonzero PES lengths when extracting payloads so TS stuffing
+  does not reach decoders. Preserve all DVB PES framing and segment bytes
+  across TS packet boundaries, including the last PES flushed at EOF.
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-mpegts/compare/v0.0.2...v0.0.3) - 2026-08-23
 
 ### Other
