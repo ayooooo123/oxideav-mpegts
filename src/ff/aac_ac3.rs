@@ -225,7 +225,7 @@ pub(crate) struct AdtsHeader {
 }
 
 /// ff_mpeg4audio_channels (libavcodec/mpeg4audio.c:59-75).
-const MPEG4AUDIO_CHANNELS: [i32; 15] = [0, 1, 2, 3, 4, 5, 6, 8, 0, 0, 0, 7, 8, 24, 8];
+pub(crate) const MPEG4AUDIO_CHANNELS: [i32; 15] = [0, 1, 2, 3, 4, 5, 6, 8, 0, 0, 0, 7, 8, 24, 8];
 
 /// ff_adts_header_parse over the first seven bytes of `buf`.
 fn adts_header(buf: &[u8]) -> Option<AdtsHeader> {

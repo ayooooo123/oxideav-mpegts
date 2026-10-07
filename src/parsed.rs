@@ -178,8 +178,10 @@ fn parsed_codec(codec_id: &str, stream_type: Option<u8>) -> Option<Codec> {
         // ISO_types: MPEG-1 and MPEG-2 audio are AV_CODEC_ID_MP3 until
         // the parser reads a frame header's layer.
         "mp1" | "mp2" | "mp3" => Codec::Mp3,
-        // Only ADTS carries the sync words the aac parser splits on.
+        // Only ADTS carries the sync words the aac parser splits on;
+        // stream type 0x11 is LATM.
         "aac" if stream_type == Some(0x0F) => Codec::Aac,
+        "aac" if stream_type == Some(0x11) => Codec::AacLatm,
         "ac3" => Codec::Ac3,
         "eac3" => Codec::Eac3,
         "opus" => Codec::Opus,
@@ -578,8 +580,10 @@ impl ParsedStream {
         // try_decode_frame, while it still decodes (has_codec_parameters
         // and has_decode_delay_been_guessed stop it): the reorder depth
         // FFmpeg's H.264 decoder finds reaches the codec context, and the
-        // AAC frame size.
-        if !(self.has_codec_parameters() && self.decode_delay_guessed()) {
+        // AAC rate, channels and frame size. The AAC decoder has
+        // AV_CODEC_CAP_CHANNEL_CONF, so its first frame is always decoded.
+        let decoding = !(self.has_codec_parameters() && self.decode_delay_guessed());
+        if decoding {
             if let Some((restriction, reorder)) = self.parser.h264_reorder() {
                 if restriction {
                     self.avctx.has_b_frames = self.avctx.has_b_frames.max(reorder);
@@ -590,11 +594,20 @@ impl ParsedStream {
                 }
             }
         }
-        if let Some(adts) = self.parser.last_adts() {
-            self.avctx.frame_size = adts.samples;
-            self.avctx.sample_rate = adts.sample_rate;
-            if adts.channels > 0 {
-                self.avctx.channels = adts.channels;
+        if decoding || self.nb_frames == 0 {
+            if let Some(adts) = self.parser.last_adts() {
+                self.avctx.frame_size = adts.samples;
+                self.avctx.sample_rate = adts.sample_rate;
+                if adts.channels > 0 {
+                    self.avctx.channels = adts.channels;
+                }
+            }
+            if let Some(latm) = self.parser.latm_config() {
+                self.avctx.frame_size = latm.frame_size;
+                self.avctx.sample_rate = latm.sample_rate;
+                if latm.channels > 0 {
+                    self.avctx.channels = latm.channels;
+                }
             }
         }
         self.nb_frames += 1;

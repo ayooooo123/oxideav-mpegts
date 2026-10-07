@@ -51,6 +51,8 @@
 //! - `truehd.ts`: FFmpeg-muxed stereo TrueHD (stream type 0x83).
 //!   `truehd_hdmv.m2ts`: the same muxed as an m2ts, whose PMT carries the
 //!   `HDMV` registration.
+//! - `aac_latm.ts`: FFmpeg-muxed AAC LC in LATM/LOAS (stream type 0x11),
+//!   48 kHz stereo.
 
 mod common;
 
@@ -175,6 +177,14 @@ fn truehd_access_units_are_split_and_timed_as_ffmpeg_splits_them() {
             Want::any("ac3", oxideav_core::MediaType::Audio),
         ],
     );
+}
+
+#[test]
+fn latm_units_are_split_and_timed_as_ffmpeg_splits_them() {
+    // FFmpeg names the codec aac_latm; the stream keeps the aac id its
+    // decoders register. Rate, channels and frame size come from the
+    // StreamMuxConfig, as the decoder reports them.
+    assert_fixture("aac_latm.ts", &[Want::audio("aac", 48_000, 2)]);
 }
 
 #[test]

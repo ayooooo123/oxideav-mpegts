@@ -14,7 +14,7 @@
 // It is distributed WITHOUT ANY WARRANTY; without even the implied warranty
 // of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See LICENSE-LGPL.
 
-use super::{aac_ac3, dca, h264, lcevc, mlp, mpegaudio, mpegvideo, opus};
+use super::{aac_ac3, dca, h264, latm, lcevc, mlp, mpegaudio, mpegvideo, opus};
 
 /// AV_NOPTS_VALUE.
 pub(crate) const NOPTS: i64 = i64::MIN;
@@ -62,6 +62,8 @@ pub(crate) enum Codec {
     Opus,
     Dts,
     TrueHd,
+    /// AAC in LATM/LOAS: FFmpeg's aac_latm, named `aac` for the decoders.
+    AacLatm,
     Lcevc,
 }
 
@@ -80,6 +82,7 @@ impl Codec {
             Codec::Opus => "opus",
             Codec::Dts => "dts",
             Codec::TrueHd => "truehd",
+            Codec::AacLatm => "aac",
             Codec::Lcevc => "lcevc",
         }
     }
@@ -558,6 +561,7 @@ enum Kind {
     Opus(opus::OpusParser),
     Dca(dca::DcaParser),
     Mlp(mlp::MlpParser),
+    Latm(latm::LatmParser),
     Lcevc(lcevc::LcevcParser),
 }
 
@@ -585,6 +589,7 @@ impl Parser {
             Codec::Opus => (Kind::Opus(opus::OpusParser::new()), pict::I),
             Codec::Dts => (Kind::Dca(dca::DcaParser::new()), pict::I),
             Codec::TrueHd => (Kind::Mlp(mlp::MlpParser::new()), pict::I),
+            Codec::AacLatm => (Kind::Latm(latm::LatmParser::new()), pict::I),
             Codec::Lcevc => (Kind::Lcevc(lcevc::LcevcParser::new()), pict::I),
         };
         Self {
@@ -638,6 +643,7 @@ impl Parser {
             Kind::Opus(p) => p.parse(&mut self.state, avctx, buf)?,
             Kind::Dca(p) => p.parse(&mut self.state, avctx, buf)?,
             Kind::Mlp(p) => p.parse(&mut self.state, avctx, buf)?,
+            Kind::Latm(p) => p.parse(&mut self.state, avctx, buf)?,
             Kind::Lcevc(p) => p.parse(&mut self.state, avctx, buf)?,
         };
         let s = &mut self.state;
@@ -692,6 +698,15 @@ impl Parser {
     pub fn last_adts(&self) -> Option<aac_ac3::AdtsHeader> {
         match &self.kind {
             Kind::AacAc3(p) => p.last_adts,
+            _ => None,
+        }
+    }
+
+    /// The configuration of the last LATM unit that stated one: what
+    /// FFmpeg's decoder reports once it has decoded it.
+    pub fn latm_config(&self) -> Option<latm::LatmConfig> {
+        match &self.kind {
+            Kind::Latm(p) => p.config,
             _ => None,
         }
     }
