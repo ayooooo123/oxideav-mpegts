@@ -14,7 +14,7 @@
 // It is distributed WITHOUT ANY WARRANTY; without even the implied warranty
 // of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See LICENSE-LGPL.
 
-use super::{aac_ac3, h264, lcevc, mpegaudio, mpegvideo, opus};
+use super::{aac_ac3, dca, h264, lcevc, mpegaudio, mpegvideo, opus};
 
 /// AV_NOPTS_VALUE.
 pub(crate) const NOPTS: i64 = i64::MIN;
@@ -60,6 +60,7 @@ pub(crate) enum Codec {
     Ac3,
     Eac3,
     Opus,
+    Dts,
     Lcevc,
 }
 
@@ -76,6 +77,7 @@ impl Codec {
             Codec::Ac3 => "ac3",
             Codec::Eac3 => "eac3",
             Codec::Opus => "opus",
+            Codec::Dts => "dts",
             Codec::Lcevc => "lcevc",
         }
     }
@@ -97,7 +99,13 @@ impl Codec {
     pub fn intra_only(self) -> bool {
         matches!(
             self,
-            Codec::Mp1 | Codec::Mp2 | Codec::Mp3 | Codec::Ac3 | Codec::Eac3 | Codec::Opus
+            Codec::Mp1
+                | Codec::Mp2
+                | Codec::Mp3
+                | Codec::Ac3
+                | Codec::Eac3
+                | Codec::Opus
+                | Codec::Dts
         )
     }
 }
@@ -525,6 +533,7 @@ enum Kind {
     MpegAudio(mpegaudio::MpegAudioParser),
     AacAc3(aac_ac3::AacAc3Parser),
     Opus(opus::OpusParser),
+    Dca(dca::DcaParser),
     Lcevc(lcevc::LcevcParser),
 }
 
@@ -550,6 +559,7 @@ impl Parser {
             Codec::Aac => (Kind::AacAc3(aac_ac3::AacAc3Parser::aac()), pict::I),
             Codec::Ac3 | Codec::Eac3 => (Kind::AacAc3(aac_ac3::AacAc3Parser::ac3()), pict::I),
             Codec::Opus => (Kind::Opus(opus::OpusParser::new()), pict::I),
+            Codec::Dts => (Kind::Dca(dca::DcaParser::new()), pict::I),
             Codec::Lcevc => (Kind::Lcevc(lcevc::LcevcParser::new()), pict::I),
         };
         Self {
@@ -601,6 +611,7 @@ impl Parser {
             Kind::MpegAudio(p) => p.parse(&mut self.state, avctx, buf)?,
             Kind::AacAc3(p) => p.parse(&mut self.state, avctx, buf)?,
             Kind::Opus(p) => p.parse(&mut self.state, avctx, buf)?,
+            Kind::Dca(p) => p.parse(&mut self.state, avctx, buf)?,
             Kind::Lcevc(p) => p.parse(&mut self.state, avctx, buf)?,
         };
         let s = &mut self.state;

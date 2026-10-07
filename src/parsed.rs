@@ -183,6 +183,7 @@ fn parsed_codec(codec_id: &str, stream_type: Option<u8>) -> Option<Codec> {
         "ac3" => Codec::Ac3,
         "eac3" => Codec::Eac3,
         "opus" => Codec::Opus,
+        "dts" => Codec::Dts,
         "lcevc" => Codec::Lcevc,
         _ => return None,
     })

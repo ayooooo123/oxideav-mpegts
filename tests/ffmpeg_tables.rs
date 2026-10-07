@@ -41,6 +41,13 @@
 //!   LCEVC enhancement track, stream type 0x36).
 //! - `pmt_change.ts`: an FFmpeg-muxed MP2 file, then one with MP2 and
 //!   AC-3 on a new PID whose PMT is rewritten to version 1.
+//! - `dts_core.ts`: a stereo DTS core (stream type 0x82), one frame per
+//!   PES. `dts_two_per_pes.ts`: the first 203 packets of FATE's
+//!   `dts/dts.ts`, cut where a PES starts (private PES, two 5.1 frames
+//!   per PES).
+//!   `dtshd_ma.ts`: FATE's `dts/master_audio_7.1_24bit.dts` remuxed by
+//!   `ffmpeg -t 0.3 -c copy -f mpegts` (a core and its DTS-HD extension
+//!   substream in each frame).
 
 mod common;
 
@@ -138,6 +145,19 @@ fn a_pmt_version_that_adds_a_pid_adds_its_stream() {
         "pmt_change.ts",
         &[Want::audio("mp2", 48_000, 1), Want::audio("ac3", 48_000, 1)],
     );
+}
+
+#[test]
+fn dts_frames_are_split_and_timed_as_ffmpeg_splits_them() {
+    assert_fixture("dts_core.ts", &[Want::audio("dts", 48_000, 2)]);
+    assert_fixture("dts_two_per_pes.ts", &[Want::audio("dts", 48_000, 6)]);
+    // FFmpeg's 8 channels come from the decoder reading the lossless
+    // extension; the parser states the rate.
+    let dts_hd = Want {
+        sample_rate: Some(48_000),
+        ..Want::any("dts", oxideav_core::MediaType::Audio)
+    };
+    assert_fixture("dtshd_ma.ts", &[dts_hd]);
 }
 
 #[test]
