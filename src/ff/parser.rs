@@ -3,7 +3,10 @@
 // av_parser_parse2, ff_fetch_timestamp, ff_combine_frame) and the parts of
 // libavutil/rational.c (av_reduce, av_mul_q) and libavutil/mathematics.c
 // (av_rescale_rnd, av_add_stable) the parser stage uses.
-// Copyright (c) 2003 Fabrice Bellard, 2003 Michael Niedermayer
+// Copyright (c) 2003 Fabrice Bellard
+// Copyright (c) 2003 Michael Niedermayer (parser.c)
+// Copyright (c) 2003 Michael Niedermayer <michaelni@gmx.at> (rational.c)
+// Copyright (c) 2005-2012 Michael Niedermayer <michaelni@gmx.at> (mathematics.c)
 //
 // This file is free software; you can redistribute it and/or modify it under
 // the terms of the GNU Lesser General Public License as published by the Free
@@ -22,9 +25,13 @@ pub(crate) const END_NOT_FOUND: i64 = -100;
 /// AV_PARSER_PTS_NB.
 const PTS_NB: usize = 4;
 /// The most one parser holds while it looks for the end of a unit. FFmpeg
-/// grows without bound; past this the held bytes are dropped, as the
-/// demuxer drops an over-long PES.
+/// grows without bound; a longer unit is an [`Overflow`].
 pub(crate) const MAX_HELD_BYTES: usize = 32 << 20;
+
+/// A unit grew past [`MAX_HELD_BYTES`] before its end was found. The
+/// held bytes and the frame search were dropped with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Overflow;
 
 pub(crate) fn is_relative(ts: i64) -> bool {
     ts >= RELATIVE_TS_BASE - (1 << 48)
@@ -245,6 +252,13 @@ pub(crate) struct CodecCtx {
     pub coded_height: i32,
     pub framerate: Q,
     pub has_b_frames: i32,
+    /// avctx->extradata: the parameter sets find_stream_info's
+    /// extract_extradata took from the first unit that had them, which
+    /// every parser opened later loads.
+    pub extradata: Vec<u8>,
+    /// The stream's r_frame_rate (0/1 until find_stream_info settles it):
+    /// a video stream's frame duration when the codec states no rate.
+    pub r_frame_rate: Q,
 }
 
 impl CodecCtx {
@@ -260,6 +274,8 @@ impl CodecCtx {
             coded_height: 0,
             framerate: Q { num: 0, den: 1 },
             has_b_frames: 0,
+            extradata: Vec::new(),
+            r_frame_rate: Q { num: 0, den: 1 },
         }
     }
 }
@@ -293,7 +309,7 @@ impl ParseContext {
 
     /// ff_combine_frame: `None` while the unit is incomplete (`buf`
     /// kept) or `next` lies past `buf`, else the whole unit.
-    pub fn combine(&mut self, mut next: i64, buf: &[u8]) -> Option<Vec<u8>> {
+    pub fn combine(&mut self, mut next: i64, buf: &[u8]) -> Result<Option<Vec<u8>>, Overflow> {
         while self.overread > 0 {
             let b = self.buffer.get(self.overread_index).copied().unwrap_or(0);
             self.put(self.index, b);
@@ -302,7 +318,7 @@ impl ParseContext {
             self.overread -= 1;
         }
         if next > buf.len() as i64 {
-            return None;
+            return Ok(None);
         }
         if buf.is_empty() && next == END_NOT_FOUND {
             next = 0;
@@ -310,15 +326,15 @@ impl ParseContext {
         self.last_index = self.index;
         if next == END_NOT_FOUND {
             if self.index + buf.len() > MAX_HELD_BYTES {
-                // Bounded: drop the unit instead of holding more.
-                self.index = 0;
-                self.buffer = Vec::new();
-                return None;
+                *self = Self::default();
+                self.state = !0;
+                self.state64 = !0;
+                return Err(Overflow);
             }
             self.buffer.truncate(self.index);
             self.buffer.extend_from_slice(buf);
             self.index += buf.len();
-            return None;
+            return Ok(None);
         }
         let size = (self.index as i64 + next).max(0) as usize;
         self.overread_index = size;
@@ -348,7 +364,7 @@ impl ParseContext {
             self.overread += 1;
             next += 1;
         }
-        Some(unit)
+        Ok(Some(unit))
     }
 
     /// `&pc->buffer[pc->last_index + next]`, `-next` bytes: where a unit
@@ -524,7 +540,8 @@ impl Parser {
     /// av_parser_parse2: one parser call on `buf` (empty at the end of
     /// input). Returns the bytes consumed and the unit completed, if any.
     /// `rai` is the container's random-access indicator of the packet
-    /// `buf` starts.
+    /// `buf` starts. [`Overflow`] when a unit outgrew
+    /// [`MAX_HELD_BYTES`]; the parser must then be replaced.
     #[allow(clippy::too_many_arguments)]
     pub fn parse2(
         &mut self,
@@ -534,7 +551,7 @@ impl Parser {
         dts: i64,
         pos: i64,
         rai: bool,
-    ) -> (usize, Option<Vec<u8>>) {
+    ) -> Result<(usize, Option<Vec<u8>>), Overflow> {
         let s = &mut self.state;
         if !s.fetched_offset {
             s.next_frame_offset = pos;
@@ -558,10 +575,10 @@ impl Parser {
             s.fetch_timestamp(0, false, false);
         }
         let (index, out) = match &mut self.kind {
-            Kind::H264(p) => p.parse(&mut self.state, avctx, buf),
-            Kind::MpegVideo(p) => p.parse(&mut self.state, avctx, buf),
-            Kind::MpegAudio(p) => p.parse(&mut self.state, avctx, buf),
-            Kind::AacAc3(p) => p.parse(&mut self.state, avctx, buf),
+            Kind::H264(p) => p.parse(&mut self.state, avctx, buf)?,
+            Kind::MpegVideo(p) => p.parse(&mut self.state, avctx, buf)?,
+            Kind::MpegAudio(p) => p.parse(&mut self.state, avctx, buf)?,
+            Kind::AacAc3(p) => p.parse(&mut self.state, avctx, buf)?,
         };
         let s = &mut self.state;
         if avctx.codec.is_video() {
@@ -586,7 +603,7 @@ impl Parser {
         }
         let index = index.clamp(0, len.max(0));
         s.cur_offset = s.cur_offset.wrapping_add(index);
-        (index as usize, out)
+        Ok((index as usize, out))
     }
 
     /// The active H.264 SPS's `(bitstream_restriction_flag,
@@ -598,6 +615,14 @@ impl Parser {
                 .active_sps
                 .as_ref()
                 .map(|s| (s.bitstream_restriction_flag, s.num_reorder_frames)),
+            _ => None,
+        }
+    }
+
+    /// The H.264 picture the last unit completes, if it decodes.
+    pub fn h264_picture(&self) -> Option<h264::OutputPicture> {
+        match &self.kind {
+            Kind::H264(p) => p.picture,
             _ => None,
         }
     }
@@ -694,14 +719,17 @@ mod tests {
     #[test]
     fn combine_holds_until_the_end_and_keeps_bytes_read_past_it() {
         let mut pc = ParseContext::new();
-        assert_eq!(pc.combine(END_NOT_FOUND, b"abcd"), None);
+        assert_eq!(pc.combine(END_NOT_FOUND, b"abcd"), Ok(None));
         // The unit ended two bytes before this buffer.
-        assert_eq!(pc.combine(-2, b"ef").as_deref(), Some(&b"ab"[..]));
+        assert_eq!(pc.combine(-2, b"ef").unwrap().as_deref(), Some(&b"ab"[..]));
         assert_eq!(pc.before_last(-2), b"cd");
         // The two bytes come back in front of the next unit.
-        assert_eq!(pc.combine(1, b"ef").as_deref(), Some(&b"cde"[..]));
+        assert_eq!(pc.combine(1, b"ef").unwrap().as_deref(), Some(&b"cde"[..]));
         // The end of input flushes what is held.
-        assert_eq!(pc.combine(END_NOT_FOUND, b"gh"), None);
-        assert_eq!(pc.combine(END_NOT_FOUND, b"").as_deref(), Some(&b"gh"[..]));
+        assert_eq!(pc.combine(END_NOT_FOUND, b"gh"), Ok(None));
+        assert_eq!(
+            pc.combine(END_NOT_FOUND, b"").unwrap().as_deref(),
+            Some(&b"gh"[..])
+        );
     }
 }

@@ -107,6 +107,21 @@ fn a_partial_last_packet_ends_the_stream() {
 }
 
 #[test]
+fn a_cut_204_byte_trailer_keeps_its_packet() {
+    // 204-byte framing: each TS packet followed by 16 trailer bytes. FFmpeg
+    // needs only the 188-byte packet (mpegts.c read_packet) and skips the
+    // trailer separately, so a stream cut inside the last trailer keeps
+    // its last packet: ffprobe prints the 188-byte table for both.
+    let mut framed: Vec<u8> = TS
+        .chunks(TS_PACKET_LEN)
+        .flat_map(|p| p.iter().copied().chain(0u8..16))
+        .collect();
+    assert_ffmpeg_packets(&drain(&mut *open(framed.clone())));
+    framed.truncate(framed.len() - 8);
+    assert_ffmpeg_packets(&drain(&mut *open(framed)));
+}
+
+#[test]
 fn stream_parameters_equal_ffmpeg() {
     // ffprobe -show_entries stream=codec_name,width,height,pix_fmt,
     // r_frame_rate,sample_rate,channels

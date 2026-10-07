@@ -53,11 +53,41 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 - MPEG-1 video streams (`stream_type` 0x01) start as MPEG-2 in the
   parser and are named `mpeg1video` from a sequence header without an
   extension, as FFmpeg's ISO_types does.
-- A PID the PMT lists twice keeps one stream; a later entry that names a
-  codec replaces the earlier one (FATE's `ac3/mp3ac325-4864-small.ts`).
+- A PID the PMT lists twice keeps one stream, decided as FFmpeg's pmt_cb
+  decides it: an entry with another stream type resets the codec (kept if
+  the type names none) and reopens the probe; descriptors name a codec
+  only while it is unknown or the probe is open. So a later entry with
+  the same type does not replace a codec a descriptor already named
+  (FATE's `ac3/mp3ac325-4864-small.ts` changes type and becomes AC-3).
+- Empty PES (no payload byte) are no packets, as in FFmpeg.
 
 ### Fixed
 
+- Opening is bounded on input that never ends the read-ahead: the PAT
+  and PMT searches stop after 128 MiB (`ResourceExhausted`), and the
+  stream-info read-ahead after 128 MiB of input or 64 MiB of queued
+  packets (each charged its payload and bookkeeping) — endless null
+  packets after a PMT, or endless tiny PES, no longer read or queue
+  without end.
+- A parser unit longer than 32 MiB is a `ResourceExhausted` error, after
+  the packets before it; it was dropped silently.
+- A 204-byte packet needs only its 188-byte TS packet: input that ends
+  inside the trailer keeps it, as FFmpeg's `read_packet` does.
+- ADTS: channel configuration 7 is eight channels and configuration 0
+  takes its count from the program config element, as FFmpeg's decoder
+  reports them (it was the raw configuration value).
+- H.264: the SPS and PPS the read-ahead finds are kept
+  (`extract_extradata`) and loaded by every parser opened afterwards —
+  after the read-ahead and after a seek — so units before the next
+  in-band SPS/PPS are parsed and timed as FFmpeg times them.
+- Video whose codec states no frame rate is timed with the rate FFmpeg
+  estimates from the DTS while reading ahead (`ff_rfps_add_frame` /
+  `ff_rfps_calculate`, then the `r_frame_rate` default), which also
+  becomes the stream's frame rate.
+- H.264 without a bitstream restriction gets the reorder depth FFmpeg's
+  decoder learns from picture order (`h264_select_output_frame`), so DTS
+  it reconstructs match.
+- The ported files carry every copyright notice of their FFmpeg sources.
 - A partial packet at the end of the input (FATE's
   `h264/h264_intra_first-small.ts` ends 40 bytes into one) ends the
   stream instead of failing it with "short read at packet boundary",

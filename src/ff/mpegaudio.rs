@@ -3,7 +3,10 @@
 // libavcodec/mpegaudiodecheader.[ch] (ff_mpa_check_header,
 // ff_mpegaudio_decode_header, ff_mpa_decode_header) and the tables of
 // libavcodec/mpegaudiotabs.h.
-// Copyright (c) 2003 Fabrice Bellard, 2003 Michael Niedermayer
+// Copyright (c) 2003 Fabrice Bellard
+// Copyright (c) 2003 Michael Niedermayer (mpegaudio_parser.c)
+// Copyright (c) 2001, 2002 Fabrice Bellard (mpegaudiodecheader.[ch])
+// copyright (c) 2002 Fabrice Bellard (mpegaudiotabs.h)
 //
 // This file is free software; you can redistribute it and/or modify it under
 // the terms of the GNU Lesser General Public License as published by the Free
@@ -11,7 +14,7 @@
 // It is distributed WITHOUT ANY WARRANTY; without even the implied warranty
 // of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See LICENSE-LGPL.
 
-use super::parser::{Codec, CodecCtx, ParseContext, ParserState, END_NOT_FOUND};
+use super::parser::{Codec, CodecCtx, Overflow, ParseContext, ParserState, END_NOT_FOUND};
 
 /// header + layer + freq + lsf/mpeg25
 const SAME_HEADER_MASK: u32 = 0xFFE0_0000 | 3 << 17 | 3 << 10 | 3 << 19;
@@ -122,7 +125,7 @@ impl MpegAudioParser {
         s: &mut ParserState,
         avctx: &mut CodecCtx,
         buf: &[u8],
-    ) -> (i64, Option<Vec<u8>>) {
+    ) -> Result<(i64, Option<Vec<u8>>), Overflow> {
         let mut state = self.pc.state;
         let size = buf.len();
         let mut i = 0usize;
@@ -171,16 +174,16 @@ impl MpegAudioParser {
             }
         }
         self.pc.state = state;
-        let Some(unit) = self.pc.combine(next, buf) else {
-            return (size as i64, None);
+        let Some(unit) = self.pc.combine(next, buf)? else {
+            return Ok((size as i64, None));
         };
         if flush && unit.len() >= 128 && unit.starts_with(b"TAG") {
-            return (next, None);
+            return Ok((next, None));
         }
         if flush && unit.len() >= 32 && unit.starts_with(b"APETAGEX") {
-            return (next, None);
+            return Ok((next, None));
         }
-        (next, Some(unit))
+        Ok((next, Some(unit)))
     }
 }
 

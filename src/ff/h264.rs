@@ -7,6 +7,11 @@
 // (avpriv_find_start_code, ff_startcode_find_candidate_c) and
 // libavutil/imgutils.c (av_image_check_size) it calls.
 // Copyright (c) 2003 Michael Niedermayer <michaelni@gmx.at>
+// Copyright (C) 2012 - 2013 Guillaume Martres
+// Copyright (C) 2012 - 2013 Mickael Raulet (h2645_vui.c)
+// Copyright (C) 2012 - 2013 Gildas Cocherel
+// Copyright (C) 2013 Vittorio Giovara (h2645_sei.c, h2645_vui.c)
+// Copyright (c) 2003-2010 Michael Niedermayer <michaelni@gmx.at> (startcode.c)
 //
 // This file is free software; you can redistribute it and/or modify it under
 // the terms of the GNU Lesser General Public License as published by the Free
@@ -26,7 +31,7 @@ use std::sync::Arc;
 
 use super::bits::BitReader;
 use super::parser::{
-    find_start_code, pict, reduce, rescale, CodecCtx, ParseContext, ParserState, PixFmt,
+    find_start_code, pict, reduce, rescale, CodecCtx, Overflow, ParseContext, ParserState, PixFmt,
     END_NOT_FOUND, NOPTS, Q,
 };
 
@@ -179,6 +184,27 @@ pub(crate) struct H264Parser {
     reference_dts: i64,
     last_frame_num: i32,
     last_picture_structure: i32,
+    /// got_first: the codec context's extradata was loaded.
+    got_first: bool,
+    /// The picture the last unit completes, as the decoder's
+    /// h264_select_output_frame sees it.
+    pub picture: Option<OutputPicture>,
+    /// A first field waiting for its pair: (POC, structure, frame_num,
+    /// IDR).
+    pending_field: Option<(i32, i32, i32, bool)>,
+}
+
+/// A picture the decoder completes (a frame, or the second field of a
+/// complementary pair), in decode order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OutputPicture {
+    /// cur->poc: the lower of its field POCs.
+    pub poc: i32,
+    pub b: bool,
+    /// An IDR: the decoder's idr() clears its POC history first.
+    pub idr: bool,
+    /// MMCO_RESET: the history is cleared once the picture is marked.
+    pub mmco_reset: bool,
 }
 
 /// AV_PICTURE_STRUCTURE_* (avcodec.h).
@@ -203,6 +229,44 @@ impl H264Parser {
             reference_dts: NOPTS,
             last_frame_num: i32::MAX,
             last_picture_structure: STRUCT_UNKNOWN,
+            got_first: false,
+            picture: None,
+            pending_field: None,
+        }
+    }
+
+    /// ff_h264_decode_extradata for Annex B extradata (decode_extradata_ps):
+    /// its SPS and PPS into the parameter set lists; the first that
+    /// fails to decode ends it. An SPS is tried as FFmpeg tries it, from
+    /// the NAL without emulation prevention, then from its raw bytes.
+    fn decode_extradata(&mut self, data: &[u8]) {
+        let mut at = 0;
+        loop {
+            at = find_nal_start(data, at);
+            if at >= data.len() {
+                return;
+            }
+            let (consumed, nal) = extract_rbsp(&data[at..]);
+            let raw = &data[at..at + consumed];
+            at += consumed.max(1);
+            let Some(&header) = nal.first() else { continue };
+            match header & 0x1F {
+                NAL_SPS => {
+                    let sps = decode_sps(&mut BitReader::new(&nal[1..]))
+                        .or_else(|| decode_sps(&mut BitReader::new(&raw[1..])));
+                    let Some((id, sps)) = sps else { return };
+                    self.sps_list[id] = Some(Arc::new(sps));
+                }
+                NAL_PPS => {
+                    let Some((id, pps)) =
+                        decode_pps(&mut BitReader::new(&nal[1..]), &self.sps_list)
+                    else {
+                        return;
+                    };
+                    self.pps_list[id] = Some(Arc::new(pps));
+                }
+                _ => {}
+            }
         }
     }
 
@@ -282,10 +346,16 @@ impl H264Parser {
         s: &mut ParserState,
         avctx: &mut CodecCtx,
         buf: &[u8],
-    ) -> (i64, Option<Vec<u8>>) {
+    ) -> Result<(i64, Option<Vec<u8>>), Overflow> {
+        if !self.got_first {
+            self.got_first = true;
+            let extradata = std::mem::take(&mut avctx.extradata);
+            self.decode_extradata(&extradata);
+            avctx.extradata = extradata;
+        }
         let next = self.find_frame_end(buf);
-        let Some(unit) = self.pc.combine(next, buf) else {
-            return (buf.len() as i64, None);
+        let Some(unit) = self.pc.combine(next, buf)? else {
+            return Ok((buf.len() as i64, None));
         };
         if next < 0 && next != END_NOT_FOUND {
             let held = self.pc.before_last(next).to_vec();
@@ -340,7 +410,7 @@ impl H264Parser {
                 }
             }
         }
-        (next, Some(unit))
+        Ok((next, Some(unit)))
     }
 
     /// parse_nal_units.
@@ -349,6 +419,7 @@ impl H264Parser {
         s.key_frame = 0;
         s.picture_structure = STRUCT_UNKNOWN;
         self.sei = Sei::reset();
+        self.picture = None;
         if buf.is_empty() {
             return;
         }
@@ -493,6 +564,38 @@ impl H264Parser {
                 None => return,
             }
         }
+        // The picture the decoder completes: a frame, or the second field
+        // of a pair (same frame_num, the other parity; h264_field_start).
+        let poc = field_poc[0].min(field_poc[1]);
+        let idr = nal_type == NAL_IDR;
+        let b = s.pict_type == pict::B;
+        self.picture = if self.picture_structure == PICT_FRAME {
+            self.pending_field = None;
+            Some(OutputPicture {
+                poc,
+                b,
+                idr,
+                mmco_reset: got_reset,
+            })
+        } else {
+            match self.pending_field.take() {
+                Some((first, structure, frame_num, first_idr))
+                    if structure != self.picture_structure && frame_num == self.poc.frame_num =>
+                {
+                    Some(OutputPicture {
+                        poc: first.min(poc),
+                        b,
+                        idr: idr || first_idr,
+                        mmco_reset: got_reset,
+                    })
+                }
+                _ => {
+                    self.pending_field =
+                        Some((poc, self.picture_structure, self.poc.frame_num, idr));
+                    None
+                }
+            }
+        };
         self.poc.prev_frame_num = if got_reset { 0 } else { self.poc.frame_num };
         self.poc.prev_frame_num_offset = if got_reset {
             0
@@ -697,6 +800,32 @@ fn x264_build(text: &[u8]) -> Option<i32> {
         build
     };
     (build > 0).then_some(build)
+}
+
+/// extract_extradata_h2645 for H.264 (libavcodec/bsf/extract_extradata.c):
+/// the SPS and PPS NAL units of `unit`, each behind a four-byte start
+/// code, if it has an SPS.
+pub(crate) fn extract_extradata(unit: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut has_sps = false;
+    let mut at = 0;
+    loop {
+        at = find_nal_start(unit, at);
+        if at >= unit.len() {
+            break;
+        }
+        let (consumed, _) = extract_rbsp(&unit[at..]);
+        let raw = &unit[at..at + consumed];
+        at += consumed.max(1);
+        match raw.first().map(|h| h & 0x1F) {
+            Some(NAL_SPS) => has_sps = true,
+            Some(NAL_PPS) => {}
+            _ => continue,
+        }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(raw);
+    }
+    has_sps.then_some(out)
 }
 
 /// ff_startcode_find_candidate_c: the first zero byte.

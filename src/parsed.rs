@@ -7,7 +7,8 @@
 // ff_read_frame_flush / ff_update_cur_dts on seek; with libavformat/mpegts.c's
 // stream setup (every PES stream is parsed with AVSTREAM_PARSE_FULL; stream
 // types 0x03 and 0x04 start as MP3; AVFMTCTX_NOHEADER).
-// Copyright (c) 2000-2003 Fabrice Bellard
+// Copyright (c) 2000, 2001, 2002 Fabrice Bellard (demux.c)
+// Copyright (c) 2002-2003 Fabrice Bellard (mpegts.c)
 //
 // This file is free software; you can redistribute it and/or modify it under
 // the terms of the GNU Lesser General Public License as published by the Free
@@ -46,15 +47,28 @@ use oxideav_core::{
 };
 
 use crate::demuxer::{MpegTsDemuxer, PesInfo};
+use crate::ff::h264::OutputPicture;
 use crate::ff::parser::{
-    is_relative, pict, rescale, rescale_rnd, Codec, CodecCtx, Parser, PixFmt, Rnd, NOPTS,
-    RELATIVE_TS_BASE,
+    is_relative, pict, rescale, rescale_rnd, Codec, CodecCtx, Parser, PixFmt, Rnd, MAX_HELD_BYTES,
+    NOPTS, RELATIVE_TS_BASE,
 };
-use crate::ff::timing::{Pending, StreamTiming};
+use crate::ff::timing::{r_frame_rate, Pending, Rfps, StreamTiming, TIME_BASE};
 
 /// avformat_find_stream_info's default probesize: payload bytes the
 /// read-ahead returns.
 const PROBE_BYTES: u64 = 5_000_000;
+/// Input the read-ahead reads at most, beyond which it ends as if the
+/// probe size were reached. FFmpeg has no such bound (input of null
+/// packets keeps it reading); this one only binds on input like that,
+/// far past the probe size and analyze duration of any real stream.
+const READ_AHEAD_TS_BYTES: u64 = 128 << 20;
+/// Memory the read-ahead's queued packets may take, each charged its
+/// payload allocation and [`QUEUE_ENTRY_BYTES`]: the bound for input of
+/// many tiny packets, which the probe size (payload bytes) does not see.
+const READ_AHEAD_QUEUE_BYTES: usize = 64 << 20;
+/// A queued packet's own cost beyond its payload: the entry and the
+/// payload allocation's bookkeeping.
+const QUEUE_ENTRY_BYTES: usize = std::mem::size_of::<Pending>() + 32;
 /// max_analyze_duration once every stream is analyzed (5 s).
 const ANALYZE_ALL_US: i64 = 5_000_000;
 /// max_stream_analyze_duration for "mpegts" (7 s).
@@ -78,6 +92,68 @@ struct ParsedStream {
     info_duration: i64,
     fps_first_dts: i64,
     fps_last_dts: i64,
+    /// A video stream's r_frame_rate estimation, while reading ahead.
+    rfps: Option<Rfps>,
+    /// The H.264 decoder's POC history, while reading ahead.
+    output_order: OutputOrder,
+}
+
+/// H264_MAX_DPB_FRAMES.
+const MAX_DPB_FRAMES: usize = 16;
+
+/// The POC history h264_select_output_frame grows the reorder depth
+/// from (libavcodec/h264_slice.c:1328-1351): the highest POCs of the
+/// pictures decoded since the last reset, ascending. Reset by an IDR
+/// (idr()), after an MMCO_RESET picture (ff_h264_execute_ref_pic_marking)
+/// and on an impossible order. The decoder also resets it on a missing
+/// reference or a frame_num gap, which need its reference lists and are
+/// not emulated.
+struct OutputOrder {
+    last_pocs: [i32; MAX_DPB_FRAMES],
+}
+
+impl OutputOrder {
+    fn new() -> Self {
+        Self {
+            last_pocs: [i32::MIN; MAX_DPB_FRAMES],
+        }
+    }
+
+    /// One decoded picture: the reorder depth its order shows raises
+    /// `has_b_frames` unless the SPS states one (`restriction`).
+    fn select(&mut self, picture: OutputPicture, has_b_frames: &mut i32, restriction: bool) {
+        if picture.idr {
+            *self = Self::new();
+        }
+        let pocs = &mut self.last_pocs;
+        let mut i = 0;
+        loop {
+            if i == MAX_DPB_FRAMES || picture.poc < pocs[i] {
+                if i > 0 {
+                    pocs[i - 1] = picture.poc;
+                }
+                break;
+            } else if i > 0 {
+                pocs[i - 1] = pocs[i];
+            }
+            i += 1;
+        }
+        let mut out_of_order = MAX_DPB_FRAMES - i;
+        let gap = pocs[MAX_DPB_FRAMES - 2] > i32::MIN
+            && i64::from(pocs[MAX_DPB_FRAMES - 1]) - i64::from(pocs[MAX_DPB_FRAMES - 2]) > 2;
+        if picture.b || gap {
+            out_of_order = out_of_order.max(1);
+        }
+        if out_of_order == MAX_DPB_FRAMES {
+            *self = Self::new();
+            self.last_pocs[0] = picture.poc;
+        } else if (*has_b_frames as usize) < out_of_order && !restriction {
+            *has_b_frames = out_of_order as i32;
+        }
+        if picture.mmco_reset {
+            *self = Self::new();
+        }
+    }
 }
 
 enum Stage {
@@ -165,6 +241,8 @@ impl ParsedDemuxer {
                         info_duration: 0,
                         fps_first_dts: NOPTS,
                         fps_last_dts: NOPTS,
+                        rfps: codec.is_video().then(Rfps::new),
+                        output_order: OutputOrder::new(),
                     })),
                     None => Stage::Raw {
                         intra_only: s.params.media_type == MediaType::Subtitle
@@ -186,6 +264,15 @@ impl ParsedDemuxer {
             deferred: None,
         };
         d.find_stream_info();
+        // ff_rfps_calculate and the r_frame_rate find_stream_info leaves.
+        for stage in &mut d.stages {
+            if let Stage::Parsed(p) = stage {
+                if let Some(rfps) = p.rfps.take() {
+                    let estimated = rfps.calculate(&p.avctx, p.info_duration);
+                    p.avctx.r_frame_rate = r_frame_rate(&p.avctx, estimated);
+                }
+            }
+        }
         d.apply_parameters();
         d.probing = false;
         // estimate_timings_from_pts. An input that cannot seek back keeps
@@ -205,22 +292,35 @@ impl ParsedDemuxer {
     }
 
     /// The read-ahead, until the probe size, the analyze duration, the
-    /// end of input, or a read error.
+    /// end of input, or a read error; and, on input those never end (no
+    /// packets, or packets too small to add up), until
+    /// [`READ_AHEAD_TS_BYTES`] of input or [`READ_AHEAD_QUEUE_BYTES`] of
+    /// queued packets.
     fn find_stream_info(&mut self) {
         let mut read_size = 0u64;
+        let mut queued = 0usize;
+        let limit = self.inner.position().saturating_add(READ_AHEAD_TS_BYTES);
         while !self.eof && read_size < PROBE_BYTES {
             let before = self.queue.len();
-            if let Err(e) = self.read_pes() {
-                self.deferred = Some(e);
-                return;
+            match self.read_pes(Some(limit)) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(e) => {
+                    self.deferred = Some(e);
+                    return;
+                }
             }
             // The units just queued, returned one by one as
             // read_frame_internal returns them.
             for at in before..self.queue.len() {
                 let (stream, size, dts, duration) = {
                     let e = &self.queue[at];
+                    queued += QUEUE_ENTRY_BYTES + e.data.capacity();
                     (e.stream as usize, e.data.len() as u64, e.dts, e.duration)
                 };
+                if queued > READ_AHEAD_QUEUE_BYTES {
+                    return;
+                }
                 read_size += size;
                 let all = self.analyzed_all();
                 match self.stages.get_mut(stream) {
@@ -228,6 +328,14 @@ impl ParsedDemuxer {
                     Some(Stage::Parsed(p)) => {
                         if !p.returned(dts, duration, all) {
                             return;
+                        }
+                        // extract_extradata, while the stream has none.
+                        if p.avctx.extradata.is_empty() && p.avctx.codec == Codec::H264 {
+                            if let Some(extradata) =
+                                crate::ff::h264::extract_extradata(&self.queue[at].data)
+                            {
+                                p.avctx.extradata = extradata;
+                            }
                         }
                     }
                     None => {}
@@ -259,9 +367,15 @@ impl ParsedDemuxer {
                 if let Some(fmt) = p.parser.state.format.and_then(pixel_format) {
                     params.pixel_format = Some(fmt);
                 }
+                // The codec's rate, else the one estimated from the DTS
+                // (ffprobe's r_frame_rate), not the 1/time_base default.
                 let fr = p.avctx.framerate;
+                let r = p.avctx.r_frame_rate;
                 if fr.num > 0 && fr.den > 0 {
                     params.frame_rate = Some(Rational::new(fr.num, fr.den));
+                } else if r.num > 0 && r.den > 0 && (r.num, r.den) != (TIME_BASE.den, TIME_BASE.num)
+                {
+                    params.frame_rate = Some(Rational::new(r.num, r.den));
                 }
             } else {
                 if p.avctx.sample_rate > 0 {
@@ -275,10 +389,16 @@ impl ParsedDemuxer {
     }
 
     /// read_frame_internal's step: one PES through its stream's stage, or
-    /// at the end of input every parser flushed.
-    fn read_pes(&mut self) -> CoreResult<()> {
-        match self.inner.next_pes() {
-            Ok((pkt, info)) => {
+    /// at the end of input every parser flushed. With a `limit`, false
+    /// when the input position reached it before a PES did.
+    fn read_pes(&mut self, limit: Option<u64>) -> CoreResult<bool> {
+        let next = match limit {
+            Some(limit) => self.inner.next_pes_before(limit),
+            None => self.inner.next_pes().map(Some),
+        };
+        match next {
+            Ok(None) => Ok(false),
+            Ok(Some((pkt, info))) => {
                 let index = pkt.stream_index as usize;
                 match self.stages.get_mut(index) {
                     Some(Stage::Raw { intra_only, .. }) => {
@@ -303,11 +423,11 @@ impl ParsedDemuxer {
                             info,
                             false,
                             probing,
-                        );
+                        )?;
                     }
                     None => {}
                 }
-                Ok(())
+                Ok(true)
             }
             Err(CoreError::Eof) => {
                 let probing = self.probing;
@@ -322,11 +442,11 @@ impl ParsedDemuxer {
                             PesInfo::default(),
                             true,
                             probing,
-                        );
+                        )?;
                     }
                 }
                 self.eof = true;
-                Ok(())
+                Ok(true)
             }
             Err(e) => Err(e),
         }
@@ -354,12 +474,7 @@ impl ParsedStream {
     /// find_stream_info's per-stream "still needs to be handled" checks.
     fn analyzed(&self) -> bool {
         let video = self.avctx.codec.is_video();
-        let parameters = if video {
-            self.avctx.width > 0 && self.avctx.height > 0 && self.parser.state.format.is_some()
-        } else {
-            // A decoded frame tells the sample format and frame size.
-            self.avctx.sample_rate > 0 && self.avctx.channels > 0 && self.nb_frames > 0
-        };
+        let parameters = self.has_codec_parameters();
         // extract_extradata: H.264 waits for SPS and PPS, MPEG video for a
         // sequence header.
         let extradata = match self.avctx.codec {
@@ -370,6 +485,17 @@ impl ParsedStream {
         let fps = !video || self.nb_frames.saturating_sub(1) >= FPS_ANALYZE_FRAMES;
         let timestamps = self.timing.first_dts != NOPTS || self.nb_frames >= MAX_TS_PROBE;
         parameters && extradata && fps && timestamps
+    }
+
+    /// has_codec_parameters, as far as the parser and the emulated
+    /// decoder state it.
+    fn has_codec_parameters(&self) -> bool {
+        if self.avctx.codec.is_video() {
+            self.avctx.width > 0 && self.avctx.height > 0 && self.parser.state.format.is_some()
+        } else {
+            // A decoded frame tells the sample format and frame size.
+            self.avctx.sample_rate > 0 && self.avctx.channels > 0 && self.nb_frames > 0
+        }
     }
 
     /// The bookkeeping find_stream_info does on a unit it returns: false
@@ -406,15 +532,31 @@ impl ParsedStream {
                 self.info_duration = self.info_duration.saturating_add(duration);
             }
         }
-        // try_decode_frame: the decoder's reorder depth and AAC frame
-        // size reach the codec context.
-        if let Some((true, reorder)) = self.parser.h264_reorder() {
-            self.avctx.has_b_frames = self.avctx.has_b_frames.max(reorder);
+        // ff_rfps_add_frame for video.
+        if let Some(rfps) = &mut self.rfps {
+            rfps.add_frame(dts);
+        }
+        // try_decode_frame, while it still decodes (has_codec_parameters
+        // and has_decode_delay_been_guessed stop it): the reorder depth
+        // FFmpeg's H.264 decoder finds reaches the codec context, and the
+        // AAC frame size.
+        if !(self.has_codec_parameters() && self.decode_delay_guessed()) {
+            if let Some((restriction, reorder)) = self.parser.h264_reorder() {
+                if restriction {
+                    self.avctx.has_b_frames = self.avctx.has_b_frames.max(reorder);
+                }
+                if let Some(picture) = self.parser.h264_picture() {
+                    self.output_order
+                        .select(picture, &mut self.avctx.has_b_frames, restriction);
+                }
+            }
         }
         if let Some(adts) = self.parser.last_adts() {
             self.avctx.frame_size = adts.samples;
             self.avctx.sample_rate = adts.sample_rate;
-            self.avctx.channels = adts.channels;
+            if adts.channels > 0 {
+                self.avctx.channels = adts.channels;
+            }
         }
         self.nb_frames += 1;
         true
@@ -442,6 +584,8 @@ impl ParsedStream {
 
 /// parse_packet: one demuxed PES (or, with `flush`, the end of input)
 /// through the parser; each unit timed by compute_pkt_fields and queued.
+/// A unit longer than the parser holds is an error; the stream's parser
+/// starts over and the rest of this PES is dropped.
 fn parse_packet(
     p: &mut ParsedStream,
     queue: &mut VecDeque<Pending>,
@@ -450,7 +594,7 @@ fn parse_packet(
     info: PesInfo,
     flush: bool,
     probing: bool,
-) {
+) -> CoreResult<()> {
     let mut rest: &[u8] = &pkt.data;
     let (mut pts, mut dts) = (pkt.pts.unwrap_or(NOPTS), pkt.dts.unwrap_or(NOPTS));
     let mut pos = info.pos as i64;
@@ -460,7 +604,12 @@ fn parse_packet(
     while (!rest.is_empty() || (flush && got_output)) && calls < MAX_CALLS_PER_PES {
         calls += 1;
         let (next_pts, next_dts) = (pts, dts);
-        let (len, unit) = p.parser.parse2(&mut p.avctx, rest, pts, dts, pos, rai);
+        let Ok((len, unit)) = p.parser.parse2(&mut p.avctx, rest, pts, dts, pos, rai) else {
+            p.parser = Parser::new(p.avctx.codec);
+            return Err(CoreError::ResourceExhausted(format!(
+                "mpegts: stream {stream}: an access unit longer than {MAX_HELD_BYTES} bytes"
+            )));
+        };
         pts = NOPTS;
         dts = NOPTS;
         pos = -1;
@@ -504,6 +653,7 @@ fn parse_packet(
         );
         queue.push_back(e);
     }
+    Ok(())
 }
 
 impl Demuxer for ParsedDemuxer {
@@ -528,7 +678,10 @@ impl Demuxer for ParsedDemuxer {
             if self.eof {
                 return Err(CoreError::Eof);
             }
-            self.read_pes()?;
+            // Units the failing read completed come out before its error.
+            if let Err(e) = self.read_pes(None) {
+                self.deferred = Some(e);
+            }
         }
     }
 

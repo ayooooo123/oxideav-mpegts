@@ -2,7 +2,10 @@
 // Port of FFmpeg 2da55bf libavcodec/mpegvideo_parser.c (mpeg1_find_frame_end,
 // mpegvideo_extract_headers, mpegvideo_parse), with the frame rate table of
 // libavcodec/mpeg12framerate.c and ff_set_dimensions (libavcodec/utils.c).
-// Copyright (c) 2003 Fabrice Bellard, 2003 Michael Niedermayer
+// Copyright (c) 2000,2001 Fabrice Bellard
+// Copyright (c) 2002-2004 Michael Niedermayer <michaelni@gmx.at> (mpegvideo_parser.c)
+// Copyright (c) 2001 Fabrice Bellard
+// Copyright (c) 2002-2004 Michael Niedermayer <michaelni@gmx.at> (utils.c)
 //
 // This file is free software; you can redistribute it and/or modify it under
 // the terms of the GNU Lesser General Public License as published by the Free
@@ -10,7 +13,9 @@
 // It is distributed WITHOUT ANY WARRANTY; without even the implied warranty
 // of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See LICENSE-LGPL.
 
-use super::parser::{Codec, CodecCtx, ParseContext, ParserState, PixFmt, END_NOT_FOUND, Q};
+use super::parser::{
+    Codec, CodecCtx, Overflow, ParseContext, ParserState, PixFmt, END_NOT_FOUND, Q,
+};
 
 const PICTURE_START_CODE: u32 = 0x100;
 const SLICE_MIN_START_CODE: u32 = 0x101;
@@ -253,13 +258,13 @@ impl MpegVideoParser {
         s: &mut ParserState,
         avctx: &mut CodecCtx,
         buf: &[u8],
-    ) -> (i64, Option<Vec<u8>>) {
+    ) -> Result<(i64, Option<Vec<u8>>), Overflow> {
         let next = self.find_frame_end(s, buf);
-        let Some(unit) = self.pc.combine(next, buf) else {
-            return (buf.len() as i64, None);
+        let Some(unit) = self.pc.combine(next, buf)? else {
+            return Ok((buf.len() as i64, None));
         };
         self.extract_headers(s, avctx, &unit);
-        (next, Some(unit))
+        Ok((next, Some(unit)))
     }
 }
 

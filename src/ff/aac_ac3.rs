@@ -5,8 +5,13 @@
 // (aac_sync), libavcodec/adts_header.c (ff_adts_header_parse), the tables of
 // libavcodec/ac3tab.c and mpeg4audio_sample_rates.h, and the CRC-16 of
 // libavutil/crc.c (AV_CRC_16_ANSI).
-// Copyright (c) 2003 Fabrice Bellard, 2003 Michael Niedermayer,
-//           (c) 2006 Justin Ruggles
+// Copyright (c) 2003 Fabrice Bellard
+// Copyright (c) 2003 Michael Niedermayer
+// Copyright (c) 2009 Alex Converse (adts_header.c)
+// copyright (c) 2001 Fabrice Bellard (ac3tab.c)
+// Copyright (c) 2008 Baptiste Coudurier <baptiste.coudurier@free.fr>,
+//           (c) 2009 Alex Converse <alex.converse@gmail.com> (mpeg4audio_sample_rates.h)
+// copyright (c) 2006 Michael Niedermayer <michaelni@gmx.at> (crc.c)
 //
 // This file is free software; you can redistribute it and/or modify it under
 // the terms of the GNU Lesser General Public License as published by the Free
@@ -15,7 +20,7 @@
 // of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See LICENSE-LGPL.
 
 use super::bits::BitReader;
-use super::parser::{Codec, CodecCtx, ParseContext, ParserState, END_NOT_FOUND};
+use super::parser::{Codec, CodecCtx, Overflow, ParseContext, ParserState, END_NOT_FOUND};
 
 const AC3_HEADER_SIZE: i64 = 7;
 const ADTS_HEADER_SIZE: i64 = 7;
@@ -211,9 +216,16 @@ fn ac3_sync(state: u64) -> Option<(i64, bool, bool)> {
 pub(crate) struct AdtsHeader {
     pub sample_rate: i32,
     pub samples: i32,
+    /// The channels FFmpeg's decoder outputs for the frame (see
+    /// [`adts_decoder_channels`]); 0 when the frame does not state them.
     pub channels: i32,
     pub frame_length: i64,
+    chan_config: usize,
+    protection_absent: bool,
 }
+
+/// ff_mpeg4audio_channels (libavcodec/mpeg4audio.c:59-75).
+const MPEG4AUDIO_CHANNELS: [i32; 15] = [0, 1, 2, 3, 4, 5, 6, 8, 0, 0, 0, 7, 8, 24, 8];
 
 /// ff_adts_header_parse over the first seven bytes of `buf`.
 fn adts_header(buf: &[u8]) -> Option<AdtsHeader> {
@@ -222,7 +234,7 @@ fn adts_header(buf: &[u8]) -> Option<AdtsHeader> {
         return None;
     }
     gb.skip(3); // id, layer
-    gb.skip(1); // protection_absent
+    let protection_absent = gb.read1();
     gb.skip(2); // profile_objecttype
     let sr = gb.read(4) as usize;
     let sample_rate = MPEG4_SAMPLE_RATES[sr];
@@ -230,7 +242,7 @@ fn adts_header(buf: &[u8]) -> Option<AdtsHeader> {
         return None;
     }
     gb.skip(1);
-    let channels = gb.read(3) as i32;
+    let chan_config = gb.read(3) as usize;
     gb.skip(4);
     let size = i64::from(gb.read(13));
     if size < ADTS_HEADER_SIZE {
@@ -241,9 +253,56 @@ fn adts_header(buf: &[u8]) -> Option<AdtsHeader> {
     Some(AdtsHeader {
         sample_rate,
         samples: (rdb + 1) * 1024,
-        channels,
+        channels: MPEG4AUDIO_CHANNELS[chan_config],
         frame_length: size,
+        chan_config,
+        protection_absent,
     })
+}
+
+/// The channels FFmpeg's AAC decoder outputs for an ADTS `frame`: the
+/// channel configuration's count, or, for configuration 0, the count of
+/// the program config element the raw data block starts with
+/// (libavcodec/aac/aacdec.c decode_pce and count_channels: a pair element
+/// is two channels, LFE one, coupling channels none). 0 when neither
+/// states it, or the element is cut short (FFmpeg fails the frame).
+fn adts_decoder_channels(frame: &[u8], hdr: &AdtsHeader) -> i32 {
+    if hdr.chan_config != 0 {
+        return hdr.channels;
+    }
+    let start = if hdr.protection_absent { 7 } else { 9 };
+    let Some(data) = frame.get(start..) else {
+        return 0;
+    };
+    let mut gb = BitReader::new(data);
+    const ID_PCE: u32 = 5;
+    if gb.read(3) != ID_PCE {
+        return 0;
+    }
+    gb.skip(4); // element_instance_tag
+    gb.skip(2); // object_type
+    gb.skip(4); // sampling_index
+    let front = gb.read(4) as i64;
+    let side = gb.read(4) as i64;
+    let back = gb.read(4) as i64;
+    let lfe = gb.read(2) as i64;
+    let assoc = gb.read(3) as i64;
+    let cc = gb.read(4) as i64;
+    // mono and stereo mixdown tags; matrix mixdown index and pseudo surround
+    for width in [4, 4, 3] {
+        if gb.read1() {
+            gb.skip(width);
+        }
+    }
+    if gb.left() < 5 * (front + side + back + cc) + 4 * (lfe + assoc + cc) {
+        return 0;
+    }
+    let mut channels = lfe as i32;
+    for _ in 0..front + side + back {
+        channels += 1 + i32::from(gb.read1());
+        gb.skip(4);
+    }
+    channels
 }
 
 /// aac_sync: ADTS frames are trusted to their length.
@@ -294,7 +353,10 @@ pub(crate) struct AacAc3Parser {
     need_next_header: bool,
     aac: bool,
     /// The ADTS header of the last unit returned, for the timing code
-    /// (what FFmpeg's decoder would have set on the codec context).
+    /// (what FFmpeg's decoder would have set on the codec context). Its
+    /// `channels` is the decoder's output count: kept from frame to frame
+    /// until a frame states another, as the decoder keeps its
+    /// configuration.
     pub last_adts: Option<AdtsHeader>,
 }
 
@@ -331,7 +393,7 @@ impl AacAc3Parser {
         s1: &mut ParserState,
         avctx: &mut CodecCtx,
         buf: &[u8],
-    ) -> (i64, Option<Vec<u8>>) {
+    ) -> Result<(i64, Option<Vec<u8>>), Overflow> {
         s1.key_frame = -1;
         let header_size = if self.aac {
             ADTS_HEADER_SIZE
@@ -377,14 +439,18 @@ impl AacAc3Parser {
             }
             break;
         }
-        let Some(unit) = self.pc.combine(i, buf) else {
+        let Some(unit) = self.pc.combine(i, buf)? else {
             self.remaining_size -= self.remaining_size.min(size);
-            return (size, None);
+            return Ok((size, None));
         };
         if got_frame {
             if self.aac {
-                if let Some(hdr) = (unit.len() >= 7).then(|| adts_header(&unit)).flatten() {
+                if let Some(mut hdr) = (unit.len() >= 7).then(|| adts_header(&unit)).flatten() {
                     s1.key_frame = 1;
+                    hdr.channels = match adts_decoder_channels(&unit, &hdr) {
+                        0 => self.last_adts.as_ref().map_or(0, |last| last.channels),
+                        n => n,
+                    };
                     self.last_adts = Some(hdr);
                 }
             } else if let Some(hdr) = Self::last_valid_ac3(&unit) {
@@ -398,7 +464,7 @@ impl AacAc3Parser {
                 s1.duration = hdr.num_blocks * 256;
             }
         }
-        (i, Some(unit))
+        Ok((i, Some(unit)))
     }
 
     /// The header of the last syncframe of a unit whose frames chain to
@@ -444,7 +510,9 @@ mod tests {
                 sample_rate: 48000,
                 samples: 1024,
                 channels: 1,
-                frame_length: 217
+                frame_length: 217,
+                chan_config: 1,
+                protection_absent: true,
             })
         );
         // AC-3: 48 kHz, frmsizecod 12 (192 kbit/s: 384 bytes), 2/0 mode.

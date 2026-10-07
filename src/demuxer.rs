@@ -296,6 +296,11 @@ impl MpegTsDemuxer {
         let mut pat_assembler = PsiSectionAssembler::new();
         loop {
             probe_bytes += layout.packet_size as u64;
+            if probe_bytes > OPEN_SCAN_TS_BYTES {
+                return Err(CoreError::ResourceExhausted(format!(
+                    "mpegts: no PAT in the first {OPEN_SCAN_TS_BYTES} bytes"
+                )));
+            }
             let buf = match read_one_packet(
                 &mut input,
                 &mut probe_putback,
@@ -365,6 +370,12 @@ impl MpegTsDemuxer {
         let mut pmt_assembler = PsiSectionAssembler::new();
         let pmt = loop {
             probe_bytes += layout.packet_size as u64;
+            if probe_bytes > OPEN_SCAN_TS_BYTES {
+                return Err(CoreError::ResourceExhausted(format!(
+                    "mpegts: no PMT for program {selected_program} in the first \
+                     {OPEN_SCAN_TS_BYTES} bytes"
+                )));
+            }
             let buf = match read_one_packet(
                 &mut input,
                 &mut probe_putback,
@@ -410,25 +421,31 @@ impl MpegTsDemuxer {
         let mut pts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
         let mut dts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
         let mut stream_types: HashMap<u16, u8> = HashMap::new();
+        // What pmt_cb makes of each PID: every entry applied, in PMT
+        // order, to what the PID had; the streams then made in the order
+        // their PIDs first appear.
+        let mut order: Vec<u16> = Vec::new();
+        let mut identities: HashMap<u16, (EsCodec, Option<String>)> = HashMap::new();
         for pmt_stream in &pmt.streams {
-            let idx = streams.len() as u32;
-            // A PID the PMT lists again keeps its stream: a later entry
-            // that names a codec replaces the earlier one, one that does
-            // not leaves it (libavformat/mpegts.c pmt_cb reuses the PID's
-            // stream and restores the old codec when none is found).
-            if let Some(&existing) = pid_to_stream.get(&pmt_stream.elementary_pid) {
-                if let Some(mut params) = codec_params_for_pmt_stream(pmt_stream) {
-                    let info = &mut streams[existing as usize];
-                    params.language = first_iso639_language(pmt_stream).or(info.params.language.take());
-                    info.params = params;
-                    provisional.retain(|&p| p != existing);
-                    stream_types.insert(pmt_stream.elementary_pid, pmt_stream.stream_type);
-                }
-                continue;
+            let pid = pmt_stream.elementary_pid;
+            let prev = identities.get(&pid);
+            let es = pmt_entry_codec(prev.map(|(es, _)| es), pmt_stream);
+            // ISO 639 languages do not overwrite one already set
+            // (AV_DICT_DONT_OVERWRITE, mpegts.c:2280).
+            let language = prev
+                .and_then(|(_, l)| l.clone())
+                .or_else(|| first_iso639_language(pmt_stream));
+            if prev.is_none() {
+                order.push(pid);
             }
-            let mut params = match codec_params_for_pmt_stream(pmt_stream) {
+            identities.insert(pid, (es, language));
+        }
+        for pid in order {
+            let (es, language) = identities.remove(&pid).expect("listed");
+            let idx = streams.len() as u32;
+            let mut params = match es.params {
                 Some(p) => p,
-                None if private_payload_decides(pmt_stream) => {
+                None if es.payload_decides() => {
                     provisional.push(idx);
                     let mut p = CodecParameters::audio(CodecId::new("bin_data"));
                     p.media_type = oxideav_core::MediaType::Data;
@@ -439,10 +456,8 @@ impl MpegTsDemuxer {
             // Lift the ES_info ISO_639_language_descriptor (tag 0x0A,
             // §2.6.18) into the per-stream language tag so a demux →
             // remux path keeps each track's audio/subtitle language.
-            // The first language entry wins (multi-language audio is
-            // rare and a single tag is what the core surface holds).
             if params.language.is_none() {
-                if let Some(code) = first_iso639_language(pmt_stream) {
+                if let Some(code) = language {
                     params = params.with_language(code);
                 }
             }
@@ -453,11 +468,11 @@ impl MpegTsDemuxer {
                 start_time: None,
                 params,
             });
-            pid_to_stream.insert(pmt_stream.elementary_pid, idx);
-            reassemblers.insert(pmt_stream.elementary_pid, PesReassembler::new());
-            pts_trackers.insert(pmt_stream.elementary_pid, PtsTracker::new());
-            dts_trackers.insert(pmt_stream.elementary_pid, PtsTracker::new());
-            stream_types.insert(pmt_stream.elementary_pid, pmt_stream.stream_type);
+            pid_to_stream.insert(pid, idx);
+            reassemblers.insert(pid, PesReassembler::new());
+            pts_trackers.insert(pid, PtsTracker::new());
+            dts_trackers.insert(pid, PtsTracker::new());
+            stream_types.insert(pid, es.stream_type);
         }
         if streams.is_empty() {
             return Err(CoreError::invalid(
@@ -1331,8 +1346,7 @@ impl MpegTsDemuxer {
             .get_mut(&pkt.pid)
             .expect("pid_to_stream and reassemblers are kept in sync");
         if let Some(pes) = reassembler.feed(&pkt).map_err(map_ts_err)? {
-            let packet = self.finish_pes(pkt.pid, stream_idx, pes, started);
-            self.pending.push_back(packet);
+            self.emit_pes(pkt.pid, stream_idx, pes, started);
         }
         // A PES that states its length is complete with its last byte,
         // where FFmpeg's mpegts_push_data emits it, rather than at the
@@ -1341,11 +1355,21 @@ impl MpegTsDemuxer {
         if reassembler.is_complete() {
             if let Some(pes) = reassembler.flush().map_err(map_ts_err)? {
                 let pos = self.pes_start.get(&pkt.pid).copied().unwrap_or(pkt_offset);
-                let packet = self.finish_pes(pkt.pid, stream_idx, pes, pos);
-                self.pending.push_back(packet);
+                self.emit_pes(pkt.pid, stream_idx, pes, pos);
             }
         }
         Ok(true)
+    }
+
+    /// Queue a finished PES. One without payload bytes is no packet:
+    /// FFmpeg emits a PES only once `data_index > 0`
+    /// (libavformat/mpegts.c:1237, :3712).
+    fn emit_pes(&mut self, pid: u16, stream_idx: u32, pes: PesPacket, pos: u64) {
+        if pes.payload.is_empty() {
+            return;
+        }
+        let packet = self.finish_pes(pid, stream_idx, pes, pos);
+        self.pending.push_back(packet);
     }
 
     /// Decide the provisional private-PES streams from their payload:
@@ -1437,8 +1461,7 @@ impl MpegTsDemuxer {
                 .and_then(|r| r.flush().ok().flatten());
             if let Some(pes) = flushed {
                 let pos = self.pes_start.get(&pid).copied().unwrap_or(self.bytes_read);
-                let packet = self.finish_pes(pid, stream_idx, pes, pos);
-                self.pending.push_back(packet);
+                self.emit_pes(pid, stream_idx, pes, pos);
             }
         }
     }
@@ -1455,6 +1478,28 @@ impl MpegTsDemuxer {
             }
             self.pump()?;
         }
+    }
+
+    /// [`Self::next_pes`], unless the read position reaches `limit` first
+    /// (`Ok(None)`): the read-ahead's transport budget.
+    pub(crate) fn next_pes_before(&mut self, limit: u64) -> CoreResult<Option<(Packet, PesInfo)>> {
+        loop {
+            if let Some(pes) = self.pending.pop_front() {
+                return Ok(Some(pes));
+            }
+            if self.eof_reached {
+                return Err(CoreError::Eof);
+            }
+            if self.bytes_read >= limit {
+                return Ok(None);
+            }
+            self.pump()?;
+        }
+    }
+
+    /// Bytes of input read so far: where the next packet starts.
+    pub(crate) fn position(&self) -> u64 {
+        self.bytes_read
     }
 
     /// Start demuxing over from the first packet with fresh PES and
@@ -1537,10 +1582,12 @@ const MAX_PHYSICAL_PACKET: usize = 204;
 /// Drains from `putback` first (used by the resync path to feed peeked
 /// bytes back to the caller) and then from `input`.
 ///
-/// Returns `Ok(None)` when fewer than a packet's bytes remain — the
-/// caller treats that as end-of-stream, a truncated last packet
-/// included, as FFmpeg's `read_packet` turns a short read into
-/// `AVERROR_EOF` (libavformat/mpegts.c).
+/// Returns `Ok(None)` when the input ends before the packet's 188 bytes
+/// (its prefix included) are in: the caller treats that as the end of the
+/// stream, as FFmpeg's `read_packet` turns a short read into
+/// `AVERROR_EOF` (libavformat/mpegts.c:3387-3389). A 204-byte packet's
+/// trailer is skipped separately, as FFmpeg's `finished_reading_packet`
+/// skips it, so input ending inside the trailer keeps the packet.
 ///
 /// On a sync-byte mismatch we **resync** by discarding packet-sized
 /// chunks until we find one with `0x47` at the layout's sync offset
@@ -1568,8 +1615,11 @@ fn read_one_packet(
             None => break,
         }
     }
+    // The prefix and the TS packet must be complete; the trailer may not be.
+    let need = layout.sync_offset + TS_PACKET_LEN;
     while filled < psize {
         match input.read(&mut buf[filled..psize]) {
+            Ok(0) if filled >= need => break,
             Ok(0) => return Ok(None),
             Ok(n) => filled += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -1764,79 +1814,135 @@ fn first_iso639_language(pmt_stream: &crate::PmtStream) -> Option<String> {
     None
 }
 
-/// Private PES has no codec identity without its PMT descriptors. DVB
-/// subtitle services use tag 0x59; keep every service's page identifiers
-/// in the decoder's five-byte (composition, ancillary, type) records.
-/// DTS audio is named by the DVB DTS_descriptor (tag 0x7B, ETSI EN 300
-/// 468 annex G) or a registration descriptor with one of the SMPTE-RA
-/// format identifiers `DTS1`/`DTS2`/`DTS3` (512/1024/2048-sample frames).
-/// AC-3 and E-AC-3 are named by the DVB AC-3 (0x6A) and enhanced AC-3
-/// (0x7A) descriptors or the `AC-3` / `EAC3` registrations, as FFmpeg's
-/// DESC_types and REGD_types read them; stream type 0x87 is ATSC E-AC-3
-/// (MISC_types).
-fn codec_params_for_pmt_stream(stream: &crate::PmtStream) -> Option<CodecParameters> {
-    if stream.stream_type == 0x87 {
-        return Some(CodecParameters::audio(CodecId::new("eac3")));
-    }
-    if stream.stream_type != 0x06 {
-        return codec_params_for_stream_type(stream.stream_type);
-    }
-    for descriptor in stream.iter_descriptors().flatten() {
-        match descriptor.body {
-            crate::DescriptorBody::Subtitling(subtitles) => {
-                if subtitles.entries.is_empty() {
-                    continue;
-                }
-                let mut params = CodecParameters::subtitle(CodecId::new("dvb_subtitle"));
-                params.extradata.reserve(subtitles.entries.len() * 5);
-                let mut languages = String::with_capacity(subtitles.entries.len() * 4 - 1);
-                for entry in subtitles.entries {
-                    if !languages.is_empty() {
-                        languages.push(',');
-                    }
-                    for byte in entry.language_code {
-                        languages.push(char::from(byte));
-                    }
-                    params.extradata.extend_from_slice(&entry.composition_page_id.to_be_bytes());
-                    params.extradata.extend_from_slice(&entry.ancillary_page_id.to_be_bytes());
-                    params.extradata.push(entry.subtitling_type);
-                }
-                params.language = Some(languages);
-                return Some(params);
-            }
-            crate::DescriptorBody::Dts(_)
-            | crate::DescriptorBody::Registration {
-                format_identifier: [b'D', b'T', b'S', b'1'..=b'3'],
-                ..
-            } => return Some(CodecParameters::audio(CodecId::new("dts"))),
-            crate::DescriptorBody::Ac3(_)
-            | crate::DescriptorBody::Registration { format_identifier: [b'A', b'C', b'-', b'3'], .. } => {
-                return Some(CodecParameters::audio(CodecId::new("ac3")))
-            }
-            crate::DescriptorBody::EnhancedAc3(_)
-            | crate::DescriptorBody::Registration { format_identifier: [b'E', b'A', b'C', b'3'], .. } => {
-                return Some(CodecParameters::audio(CodecId::new("eac3")))
-            }
-            _ => {}
-        }
-    }
-    None
+/// What FFmpeg's pmt_cb has decided about one elementary PID.
+#[derive(Clone, Debug)]
+struct EsCodec {
+    stream_type: u8,
+    params: Option<CodecParameters>,
+    /// `request_probe > 0`: descriptors may still name the codec, and a
+    /// private stream none names is identified from its payload.
+    probing: bool,
+    /// A descriptor named a codec this crate does not demux (DVB
+    /// teletext): the stream is dropped, not probed.
+    unsupported: bool,
 }
 
-/// Private PES (`stream_type` 0x06) whose ES_info descriptors name no
-/// codec — none at all, or only the informational ones (data stream
-/// alignment 0x06, ISO 639 language 0x0A, maximum bitrate 0x0E, STD
-/// 0x11, DVB stream identifier 0x52) — is identified from its payload at
-/// open, as FFmpeg probes such streams. Streams with any other
-/// descriptor (teletext, VBI, AC-3, ...) are not, so opening never
-/// reads ahead for payload no probe here recognises.
-fn private_payload_decides(stream: &crate::PmtStream) -> bool {
-    stream.stream_type == 0x06
-        && codec_params_for_pmt_stream(stream).is_none()
-        && stream
-            .iter_descriptors()
-            .all(|d| d.is_ok_and(|d| matches!(d.tag, 0x06 | 0x0A | 0x0E | 0x11 | 0x52)))
+impl EsCodec {
+    /// The private PES with no codec yet is identified from its
+    /// payload at open, as FFmpeg probes it.
+    fn payload_decides(&self) -> bool {
+        self.params.is_none() && self.probing && !self.unsupported && self.stream_type == 0x06
+    }
 }
+
+/// One PMT entry applied to what its PID had, as pmt_cb does. A stream
+/// type that differs from the PID's resets it (mpegts_set_stream_info,
+/// libavformat/mpegts.c:2918-2919, :949-1028): the codec comes from the
+/// type tables, or stays the old one if they name none, and types 0x04,
+/// 0x0F and 0x06 open a probe. Descriptors then name the codec only while
+/// it is unknown or the probe is open (:2100-2102 for DESC_types on
+/// private PES, :2286-2287 for REGD_types), and naming it closes the
+/// probe (mpegts_find_stream_type).
+///
+/// DVB subtitle services use tag 0x59; every service's page identifiers
+/// are kept in the decoder's five-byte (composition, ancillary, type)
+/// records. DTS audio is named by the DVB DTS_descriptor (tag 0x7B, ETSI
+/// EN 300 468 annex G) or the registrations `DTS1`/`DTS2`/`DTS3`; AC-3
+/// and E-AC-3 by the DVB AC-3 (0x6A) and enhanced AC-3 (0x7A) descriptors
+/// or the `AC-3` / `EAC3` registrations; stream type 0x87 is ATSC E-AC-3
+/// (MISC_types).
+fn pmt_entry_codec(prev: Option<&EsCodec>, entry: &crate::PmtStream) -> EsCodec {
+    let mut es = match prev {
+        Some(p) if p.stream_type == entry.stream_type => p.clone(),
+        _ => EsCodec {
+            stream_type: entry.stream_type,
+            params: stream_type_codec(entry.stream_type)
+                .or_else(|| prev.and_then(|p| p.params.clone())),
+            probing: matches!(entry.stream_type, 0x04 | 0x0F | 0x06),
+            unsupported: false,
+        },
+    };
+    let private = entry.stream_type == 0x06;
+    for descriptor in entry.iter_descriptors().flatten() {
+        if es.params.is_some() && !es.probing {
+            break;
+        }
+        match descriptor_codec(&descriptor, private) {
+            Some(Some(params)) => {
+                es.params = Some(params);
+                es.probing = false;
+                es.unsupported = false;
+            }
+            Some(None) => {
+                es.params = None;
+                es.probing = false;
+                es.unsupported = true;
+            }
+            None => {}
+        }
+    }
+    es
+}
+
+/// The codec a stream type names (ISO, HDMV and MISC types).
+fn stream_type_codec(stream_type: u8) -> Option<CodecParameters> {
+    match stream_type {
+        0x87 => Some(CodecParameters::audio(CodecId::new("eac3"))),
+        0x06 => None,
+        st => codec_params_for_stream_type(st),
+    }
+}
+
+/// The codec a descriptor names: `Some(None)` for one named but not
+/// demuxed here. DESC_types apply to private PES only.
+fn descriptor_codec(
+    descriptor: &crate::Descriptor<'_>,
+    private: bool,
+) -> Option<Option<CodecParameters>> {
+    let audio = |name: &str| Some(Some(CodecParameters::audio(CodecId::new(name))));
+    match &descriptor.body {
+        crate::DescriptorBody::Registration {
+            format_identifier, ..
+        } => match format_identifier {
+            [b'D', b'T', b'S', b'1'..=b'3'] => audio("dts"),
+            b"AC-3" => audio("ac3"),
+            b"EAC3" => audio("eac3"),
+            _ => None,
+        },
+        _ if !private => None,
+        crate::DescriptorBody::Subtitling(subtitles) => {
+            if subtitles.entries.is_empty() {
+                return None;
+            }
+            let mut params = CodecParameters::subtitle(CodecId::new("dvb_subtitle"));
+            params.extradata.reserve(subtitles.entries.len() * 5);
+            let mut languages = String::with_capacity(subtitles.entries.len() * 4 - 1);
+            for entry in subtitles.entries.iter() {
+                if !languages.is_empty() {
+                    languages.push(',');
+                }
+                for byte in entry.language_code {
+                    languages.push(char::from(byte));
+                }
+                params.extradata.extend_from_slice(&entry.composition_page_id.to_be_bytes());
+                params.extradata.extend_from_slice(&entry.ancillary_page_id.to_be_bytes());
+                params.extradata.push(entry.subtitling_type);
+            }
+            params.language = Some(languages);
+            Some(Some(params))
+        }
+        crate::DescriptorBody::Dts(_) => audio("dts"),
+        crate::DescriptorBody::Ac3(_) => audio("ac3"),
+        crate::DescriptorBody::EnhancedAc3(_) => audio("eac3"),
+        _ if descriptor.tag == 0x56 => Some(None),
+        _ => None,
+    }
+}
+
+/// Input the PAT and PMT searches at open read at most. FFmpeg's header
+/// scan stops at its probe size; this bound only stops input that never
+/// carries them.
+const OPEN_SCAN_TS_BYTES: u64 = 128 << 20;
 
 /// Transport-stream bytes read at open while identifying private PES
 /// streams from their payload (FFmpeg's default probe size).
@@ -2031,7 +2137,7 @@ mod tests {
                 b'f', b'r', b'a', 0x20, 0xab, 0xcd, 0xef, 0x01,
             ],
         };
-        let params = codec_params_for_pmt_stream(&stream).unwrap();
+        let params = pmt_entry_codec(None, &stream).params.unwrap();
         assert_eq!(params.codec_id.as_str(), "dvb_subtitle");
         assert_eq!(params.media_type, oxideav_core::MediaType::Subtitle);
         assert_eq!(params.language.as_deref(), Some("eng,fra"));
@@ -2042,14 +2148,21 @@ mod tests {
     fn private_pes_without_valid_subtitling_descriptor_is_not_dvb() {
         for descriptors in [vec![], vec![0x59, 0], vec![0x59, 8, b'e'], vec![0x56, 0]] {
             let stream = crate::PmtStream { stream_type: 0x06, elementary_pid: 0x101, descriptors };
-            assert!(codec_params_for_pmt_stream(&stream).is_none());
+            assert!(pmt_entry_codec(None, &stream).params.is_none());
         }
         let stream = crate::PmtStream {
             stream_type: 0x1b,
             elementary_pid: 0x101,
             descriptors: vec![0x59, 8, b'e', b'n', b'g', 0x10, 0, 1, 0, 2],
         };
-        assert_eq!(codec_params_for_pmt_stream(&stream).unwrap().codec_id.as_str(), "h264");
+        assert_eq!(
+            pmt_entry_codec(None, &stream)
+                .params
+                .unwrap()
+                .codec_id
+                .as_str(),
+            "h264"
+        );
     }
 
     #[test]
@@ -3465,7 +3578,7 @@ mod tests {
     fn private_pes_dts_registration_descriptor_names_the_codec() {
         for descriptor in [&[0x05, 4, b'D', b'T', b'S', b'2'][..], &[0x7B, 5, 0, 0, 0, 0, 0][..]] {
             let stream = crate::PmtStream { stream_type: 0x06, elementary_pid: 0x101, descriptors: descriptor.to_vec() };
-            assert_eq!(codec_params_for_pmt_stream(&stream).unwrap().codec_id.as_str(), "dts");
+            assert_eq!(pmt_entry_codec(None, &stream).params.unwrap().codec_id.as_str(), "dts");
         }
     }
 
@@ -3509,16 +3622,16 @@ mod tests {
         ];
         for (stream_type, descriptors, codec) in cases {
             let stream = crate::PmtStream { stream_type, elementary_pid: 0x101, descriptors: descriptors.to_vec() };
-            let params = codec_params_for_pmt_stream(&stream);
+            let params = pmt_entry_codec(None, &stream).params;
             assert_eq!(params.as_ref().map(|p| p.codec_id.as_str()), Some(codec), "{stream_type:#04x} {descriptors:02x?}");
         }
     }
 
     #[test]
-    fn a_pid_listed_again_takes_the_later_codec() {
+    fn a_pid_listed_again_with_another_type_takes_the_later_codec() {
         // FATE's ac3/mp3ac325-4864-small.ts lists its audio PID as MPEG
-        // audio and again as private PES with an AC-3 descriptor; FFmpeg
-        // keeps one stream for the PID, with the later codec.
+        // audio and again as private PES with an AC-3 descriptor: the new
+        // type resets the stream and opens a probe the descriptor closes.
         let mut bytes = pat_pmt_with(&[(0x1B, 0x102, &[]), (0x04, 0x101, &[]), (0x06, 0x101, &[0x6A, 1, 0])]);
         bytes.extend(private_pes_packets(0x101, &[vec![0x0B, 0x77, 0, 0]], &mut 0));
         let mut demux = MpegTsDemuxer::new(Box::new(Cursor::new(bytes))).unwrap();
@@ -3526,5 +3639,29 @@ mod tests {
         assert_eq!(codecs, ["h264", "ac3"]);
         let packet = demux.next_packet().unwrap();
         assert_eq!((packet.stream_index, packet.data.as_slice()), (1, &[0x0B, 0x77, 0, 0][..]));
+    }
+
+    #[test]
+    fn a_pid_listed_again_with_the_same_type_keeps_its_named_codec() {
+        // Two private-PES entries for one PID: the first descriptor names
+        // DTS, and with the type unchanged the AC-3 one is not consulted
+        // (ffprobe names it dts; in the other order, ac3).
+        let dts: &[u8] = &[0x7B, 5, 0, 0, 0, 0, 0];
+        let ac3: &[u8] = &[0x6A, 1, 0];
+        for (first, second, codec) in [(dts, ac3, "dts"), (ac3, dts, "ac3")] {
+            let mut bytes = pat_pmt_with(&[(0x06, 0x101, first), (0x06, 0x101, second)]);
+            bytes.extend(private_pes_packets(
+                0x101,
+                &[vec![0x0B, 0x77, 0, 0]],
+                &mut 0,
+            ));
+            let demux = MpegTsDemuxer::new(Box::new(Cursor::new(bytes))).unwrap();
+            let codecs: Vec<&str> = demux
+                .streams()
+                .iter()
+                .map(|s| s.params.codec_id.as_str())
+                .collect();
+            assert_eq!(codecs, [codec]);
+        }
     }
 }

@@ -2,7 +2,9 @@
 // Port of FFmpeg 2da55bf libavcodec/get_bits.h (the non-cached big-endian
 // reader) and libavcodec/golomb.h / golomb.c (get_ue_golomb,
 // get_ue_golomb_31, get_ue_golomb_long, get_se_golomb, get_se_golomb_long).
-// Copyright (c) 2004 Michael Niedermayer <michaelni@gmx.at>
+// Copyright (c) 2004 Michael Niedermayer <michaelni@gmx.at> (get_bits.h)
+// Copyright (c) 2003 Michael Niedermayer <michaelni@gmx.at>
+// Copyright (c) 2004 Alex Beregszaszi (golomb.h, golomb.c)
 //
 // This file is free software; you can redistribute it and/or modify it under
 // the terms of the GNU Lesser General Public License as published by the Free

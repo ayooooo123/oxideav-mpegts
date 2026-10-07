@@ -4,7 +4,9 @@
 // update_initial_durations, update_dts_from_pts, select_from_pts_buffer,
 // and the codec cases of libavcodec/utils.c av_get_audio_frame_duration
 // the parsed codecs reach.
-// Copyright (c) 2000-2003 Fabrice Bellard
+// Copyright (c) 2000, 2001, 2002 Fabrice Bellard (demux.c)
+// Copyright (c) 2001 Fabrice Bellard
+// Copyright (c) 2002-2004 Michael Niedermayer <michaelni@gmx.at> (libavcodec/utils.c)
 //
 // This file is free software; you can redistribute it and/or modify it under
 // the terms of the GNU Lesser General Public License as published by the Free
@@ -31,6 +33,203 @@ pub(crate) const TIME_BASE: Q = Q {
     num: 1,
     den: 90_000,
 };
+
+/// MAX_STD_TIMEBASES (libavformat/demux.h).
+const MAX_STD_TIMEBASES: usize = 30 * 12 + 30 + 3 + 6;
+
+/// get_std_framerate: the `i`-th standard frame rate, times 1001 * 12.
+fn std_framerate(i: usize) -> i64 {
+    let i = i as i64;
+    if i < 30 * 12 {
+        return (i + 1) * 1001;
+    }
+    let i = i - 30 * 12;
+    if i < 30 {
+        return (i + 31) * 1001 * 12;
+    }
+    let i = i - 30;
+    if i < 3 {
+        return [80, 120, 240][i as usize] * 1001 * 12;
+    }
+    [24, 30, 60, 12, 15, 48][(i - 3) as usize] * 1000 * 12
+}
+
+/// The FFStreamInfo fields ff_rfps_add_frame keeps for a video stream
+/// while find_stream_info reads ahead: r_frame_rate estimation.
+pub(crate) struct Rfps {
+    /// duration_error[j][0 sum, 1 sum of squares][standard rate].
+    duration_error: Box<[[[f64; MAX_STD_TIMEBASES]; 2]; 2]>,
+    last_dts: i64,
+    duration_count: i64,
+    rfps_duration_sum: i64,
+    duration_gcd: i64,
+}
+
+impl Rfps {
+    pub fn new() -> Self {
+        Self {
+            duration_error: Box::new([[[0.0; MAX_STD_TIMEBASES]; 2]; 2]),
+            last_dts: NOPTS,
+            duration_count: 0,
+            rfps_duration_sum: 0,
+            duration_gcd: 0,
+        }
+    }
+
+    /// ff_rfps_add_frame with a returned packet's DTS.
+    pub fn add_frame(&mut self, ts: i64) {
+        let last = self.last_dts;
+        if ts != NOPTS
+            && last != NOPTS
+            && ts > last
+            && (ts as u64).wrapping_sub(last as u64) < i64::MAX as u64
+        {
+            let base = if is_relative(ts) {
+                ts - RELATIVE_TS_BASE
+            } else {
+                ts
+            };
+            let dts = base as f64 * (TIME_BASE.num as f64 / TIME_BASE.den as f64);
+            let duration = ts - last;
+            let errors = &mut self.duration_error;
+            for i in 0..MAX_STD_TIMEBASES {
+                if errors[0][1][i] < 1e10 {
+                    let framerate = std_framerate(i);
+                    let sdts = dts * framerate as f64 / (1001 * 12) as f64;
+                    for (j, error_j) in errors.iter_mut().enumerate() {
+                        let half = j as f64 * 0.5;
+                        let ticks = (sdts + half).round_ties_even();
+                        let error = sdts - ticks + half;
+                        error_j[0][i] += error;
+                        error_j[1][i] += error * error;
+                    }
+                }
+            }
+            if self.rfps_duration_sum <= i64::MAX - duration {
+                self.duration_count += 1;
+                self.rfps_duration_sum += duration;
+            }
+            if self.duration_count % 10 == 0 {
+                let n = self.duration_count as f64;
+                for i in 0..MAX_STD_TIMEBASES {
+                    if errors[0][1][i] < 1e10 {
+                        let a0 = errors[0][0][i] / n;
+                        let error0 = errors[0][1][i] / n - a0 * a0;
+                        let a1 = errors[1][0][i] / n;
+                        let error1 = errors[1][1][i] / n - a1 * a1;
+                        if error0 > 0.04 && error1 > 0.04 {
+                            errors[0][1][i] = 2e10;
+                            errors[1][1][i] = 2e10;
+                        }
+                    }
+                }
+            }
+            // The first four deltas may jitter.
+            if self.duration_count > 3 && is_relative(ts) == is_relative(last) {
+                self.duration_gcd = gcd(self.duration_gcd, duration);
+            }
+        }
+        if ts != NOPTS {
+            self.last_dts = ts;
+        }
+    }
+
+    /// ff_rfps_calculate for the stream: the r_frame_rate it estimates
+    /// (0/1 when it does not). `codec_info_duration` is in 90 kHz units.
+    pub fn calculate(&self, avctx: &CodecCtx, codec_info_duration: i64) -> Q {
+        let tb = TIME_BASE;
+        let q2d_tb = tb.num as f64 / tb.den as f64;
+        let mut r = Q { num: 0, den: 1 };
+        let unreliable = tb_unreliable(avctx);
+        if unreliable
+            && self.duration_count > 15
+            && self.duration_gcd > (tb.den / (500 * tb.num)).max(1)
+            && self.duration_gcd < i64::MAX / tb.num
+        {
+            r = reduce(tb.den, tb.num * self.duration_gcd, INT_MAX);
+        }
+        if self.duration_count > 1 && r.num == 0 && unreliable {
+            let mut num = 0i64;
+            let mut best_error = 0.01;
+            let n = self.duration_count as f64;
+            for j in 0..MAX_STD_TIMEBASES {
+                let fr = std_framerate(j) as f64;
+                if codec_info_duration != 0
+                    && codec_info_duration as f64 * q2d_tb < (1001.0 * 11.5) / fr
+                {
+                    continue;
+                }
+                if codec_info_duration == 0 && std_framerate(j) < 1001 * 12 {
+                    continue;
+                }
+                if q2d_tb * self.rfps_duration_sum as f64 / n < (1001.0 * 12.0 * 0.8) / fr {
+                    continue;
+                }
+                for k in 0..2 {
+                    let a = self.duration_error[k][0][j] / n;
+                    let error = self.duration_error[k][1][j] / n - a * a;
+                    if error < best_error && best_error > 0.000_000_001 {
+                        best_error = error;
+                        num = std_framerate(j);
+                    }
+                }
+            }
+            // ref_rate is 1/time_base here: a standard rate always passes.
+            if num != 0 {
+                r = reduce(num, 12 * 1001, INT_MAX);
+            }
+        }
+        r
+    }
+}
+
+/// av_gcd.
+fn gcd(mut a: i64, mut b: i64) -> i64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.abs()
+}
+
+/// tb_unreliable for a parsed video stream of a format without headers.
+fn tb_unreliable(avctx: &CodecCtx) -> bool {
+    if matches!(avctx.codec, Codec::H264 | Codec::Mpeg2Video) {
+        return true;
+    }
+    let fr = avctx.framerate;
+    if fr.num == 0 {
+        // time_base 0/1 (AVFMTCTX_NOHEADER)
+        return true;
+    }
+    let mul = if avctx.codec.fields() { 2 } else { 1 };
+    let m = mul_q(fr, Q { num: mul, den: 1 });
+    let (num, den) = (m.den, m.num);
+    den >= 101 * num || den < 5 * num
+}
+
+/// The r_frame_rate find_stream_info leaves a video stream with: the
+/// estimate, else the codec's rate (times two for field codecs) when no
+/// finer than the time base, else 1/time_base (demux.c:3059-3070).
+pub(crate) fn r_frame_rate(avctx: &CodecCtx, estimated: Q) -> Q {
+    if estimated.num != 0 {
+        return estimated;
+    }
+    let mul = if avctx.codec.fields() { 2 } else { 1 };
+    let fr = mul_q(avctx.framerate, Q { num: mul, den: 1 });
+    // av_cmp_q(time_base, 1/fr) <= 0
+    if fr.num != 0
+        && fr.den != 0
+        && i128::from(TIME_BASE.num) * i128::from(fr.num)
+            <= i128::from(fr.den) * i128::from(TIME_BASE.den)
+    {
+        fr
+    } else {
+        Q {
+            num: TIME_BASE.den,
+            den: TIME_BASE.num,
+        }
+    }
+}
 
 /// One packet still in FFmpeg's buffers.
 #[derive(Clone, Debug)]
@@ -405,11 +604,19 @@ impl StreamTiming {
     }
 }
 
-/// compute_frame_duration for a parsed stream (no r_frame_rate: FFmpeg
-/// only has one after find_stream_info for streams whose codec states no
-/// frame rate). `None` when there is no duration.
+/// compute_frame_duration for a parsed stream: a video stream whose codec
+/// states no frame rate uses the stream's r_frame_rate (set once the
+/// read-ahead is over), else the codec's rate and repeat count. `None`
+/// when there is no duration.
 fn frame_duration(avctx: &CodecCtx, pc: &ParserState, size: usize) -> Option<Q> {
     if avctx.codec.is_video() {
+        let r = avctx.r_frame_rate;
+        if r.num != 0 && avctx.framerate.num == 0 {
+            return Some(Q {
+                num: r.den,
+                den: r.num,
+            });
+        }
         let fr = avctx.framerate;
         if fr.den.saturating_mul(1000) > fr.num {
             let ticks_per_frame = if avctx.codec.fields() { 2 } else { 1 };
