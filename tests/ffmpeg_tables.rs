@@ -53,6 +53,10 @@
 //!   `HDMV` registration.
 //! - `aac_latm.ts`: FFmpeg-muxed AAC LC in LATM/LOAS (stream type 0x11),
 //!   48 kHz stereo.
+//! - `hevc.ts`: `-f lavfi -i testsrc=size=64x48:rate=25 -t 0.6 -c:v libx265
+//!   -preset ultrafast -x265-params bframes=2:keyint=8 -pix_fmt yuv420p -f
+//!   mpegts`. `hevc_no_timing.ts`: such a stream that states no timing in
+//!   its VPS or VUI, so FFmpeg times it with the rate it estimates.
 
 mod common;
 
@@ -185,6 +189,12 @@ fn latm_units_are_split_and_timed_as_ffmpeg_splits_them() {
     // decoders register. Rate, channels and frame size come from the
     // StreamMuxConfig, as the decoder reports them.
     assert_fixture("aac_latm.ts", &[Want::audio("aac", 48_000, 2)]);
+}
+
+#[test]
+fn hevc_access_units_are_split_and_timed_as_ffmpeg_splits_them() {
+    assert_fixture("hevc.ts", &[Want::video("hevc", 64, 48)]);
+    assert_fixture("hevc_no_timing.ts", &[Want::video("hevc", 64, 48)]);
 }
 
 #[test]

@@ -14,7 +14,7 @@
 // It is distributed WITHOUT ANY WARRANTY; without even the implied warranty
 // of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See LICENSE-LGPL.
 
-use super::{aac_ac3, dca, h264, latm, lcevc, mlp, mpegaudio, mpegvideo, opus};
+use super::{aac_ac3, dca, h264, hevc, latm, lcevc, mlp, mpegaudio, mpegvideo, opus};
 
 /// AV_NOPTS_VALUE.
 pub(crate) const NOPTS: i64 = i64::MIN;
@@ -65,6 +65,7 @@ pub(crate) enum Codec {
     /// AAC in LATM/LOAS: FFmpeg's aac_latm, named `aac` for the decoders.
     AacLatm,
     Lcevc,
+    Hevc,
 }
 
 impl Codec {
@@ -84,13 +85,14 @@ impl Codec {
             Codec::TrueHd => "truehd",
             Codec::AacLatm => "aac",
             Codec::Lcevc => "lcevc",
+            Codec::Hevc => "hevc",
         }
     }
 
     pub fn is_video(self) -> bool {
         matches!(
             self,
-            Codec::H264 | Codec::Mpeg1Video | Codec::Mpeg2Video | Codec::Lcevc
+            Codec::H264 | Codec::Mpeg1Video | Codec::Mpeg2Video | Codec::Lcevc | Codec::Hevc
         )
     }
 
@@ -563,6 +565,7 @@ enum Kind {
     Mlp(mlp::MlpParser),
     Latm(latm::LatmParser),
     Lcevc(lcevc::LcevcParser),
+    Hevc(Box<hevc::HevcParser>),
 }
 
 /// An FFmpeg parser: codec state plus AVCodecParserContext.
@@ -591,6 +594,7 @@ impl Parser {
             Codec::TrueHd => (Kind::Mlp(mlp::MlpParser::new()), pict::I),
             Codec::AacLatm => (Kind::Latm(latm::LatmParser::new()), pict::I),
             Codec::Lcevc => (Kind::Lcevc(lcevc::LcevcParser::new()), pict::I),
+            Codec::Hevc => (Kind::Hevc(Box::new(hevc::HevcParser::new())), pict::I),
         };
         Self {
             state: ParserState::new(pict_type),
@@ -645,6 +649,7 @@ impl Parser {
             Kind::Mlp(p) => p.parse(&mut self.state, avctx, buf)?,
             Kind::Latm(p) => p.parse(&mut self.state, avctx, buf)?,
             Kind::Lcevc(p) => p.parse(&mut self.state, avctx, buf)?,
+            Kind::Hevc(p) => p.parse(&mut self.state, avctx, buf)?,
         };
         let s = &mut self.state;
         if avctx.codec.is_video() {
@@ -707,6 +712,15 @@ impl Parser {
     pub fn latm_config(&self) -> Option<latm::LatmConfig> {
         match &self.kind {
             Kind::Latm(p) => p.config,
+            _ => None,
+        }
+    }
+
+    /// The reorder depth FFmpeg's HEVC decoder takes from the SPS the
+    /// last slice used.
+    pub fn hevc_reorder(&self) -> Option<i32> {
+        match &self.kind {
+            Kind::Hevc(p) => p.active_reorder,
             _ => None,
         }
     }

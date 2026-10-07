@@ -188,6 +188,7 @@ fn parsed_codec(codec_id: &str, stream_type: Option<u8>) -> Option<Codec> {
         "dts" => Codec::Dts,
         "truehd" => Codec::TrueHd,
         "lcevc" => Codec::Lcevc,
+        "hevc" => Codec::Hevc,
         _ => return None,
     })
 }
@@ -368,10 +369,14 @@ impl ParsedDemuxer {
                             return;
                         }
                         // extract_extradata, while the stream has none.
-                        if p.avctx.extradata.is_empty() && p.avctx.codec == Codec::H264 {
-                            if let Some(extradata) =
-                                crate::ff::h264::extract_extradata(&self.queue[at].data)
-                            {
+                        if p.avctx.extradata.is_empty() {
+                            let unit = &self.queue[at].data;
+                            let extradata = match p.avctx.codec {
+                                Codec::H264 => crate::ff::h264::extract_extradata(unit),
+                                Codec::Hevc => crate::ff::hevc::extract_extradata(unit),
+                                _ => None,
+                            };
+                            if let Some(extradata) = extradata {
                                 p.avctx.extradata = extradata;
                             }
                         }
@@ -592,6 +597,10 @@ impl ParsedStream {
                     self.output_order
                         .select(picture, &mut self.avctx.has_b_frames, restriction);
                 }
+            }
+            // export_stream_params: the HEVC decoder sets the depth.
+            if let Some(reorder) = self.parser.hevc_reorder() {
+                self.avctx.has_b_frames = reorder;
             }
         }
         if decoding || self.nb_frames == 0 {

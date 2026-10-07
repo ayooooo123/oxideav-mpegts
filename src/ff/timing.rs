@@ -193,7 +193,7 @@ fn gcd(mut a: i64, mut b: i64) -> i64 {
 
 /// tb_unreliable for a parsed video stream of a format without headers.
 fn tb_unreliable(avctx: &CodecCtx) -> bool {
-    if matches!(avctx.codec, Codec::H264 | Codec::Mpeg2Video) {
+    if matches!(avctx.codec, Codec::H264 | Codec::Hevc | Codec::Mpeg2Video) {
         return true;
     }
     let fr = avctx.framerate;

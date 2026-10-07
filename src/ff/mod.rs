@@ -17,6 +17,7 @@ pub(crate) mod aac_ac3;
 pub(crate) mod bits;
 pub(crate) mod dca;
 pub(crate) mod h264;
+pub(crate) mod hevc;
 pub(crate) mod latm;
 pub(crate) mod lcevc;
 pub(crate) mod mlp;
