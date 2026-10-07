@@ -99,6 +99,16 @@ struct ParsedStream {
     /// has_codec_parameters as it stood before the unit being returned:
     /// try_decode_frame checks it before it decodes the unit.
     had_parameters: bool,
+    /// While reading ahead: the H.264 picture each queued unit completes
+    /// (and whether it is a key unit), in queue order, as the parser saw
+    /// it when it returned the unit.
+    unit_pictures: VecDeque<Option<(OutputPicture, bool)>>,
+    /// A key picture (IDR or recovery point) was decoded: the decoder
+    /// outputs pictures from there on.
+    recovered: bool,
+    /// Pictures decoded since then: what nb_decoded_frames counts, before
+    /// the reorder delay.
+    decoded_pictures: u64,
 }
 
 /// H264_MAX_DPB_FRAMES.
@@ -271,6 +281,7 @@ impl ParsedDemuxer {
         // ff_rfps_calculate and the r_frame_rate find_stream_info leaves.
         for stage in &mut d.stages {
             if let Stage::Parsed(p) = stage {
+                p.unit_pictures = VecDeque::new();
                 if let Some(rfps) = p.rfps.take() {
                     let estimated = rfps.calculate(&p.avctx, p.info_duration);
                     p.avctx.r_frame_rate = r_frame_rate(&p.avctx, estimated);
@@ -317,6 +328,9 @@ impl ParsedDemuxer {
                         rfps: codec.is_video().then(Rfps::new),
                         output_order: OutputOrder::new(),
                         had_parameters: false,
+                        unit_pictures: VecDeque::new(),
+                        recovered: false,
+                        decoded_pictures: 0,
                     })),
                     // ff_is_intra_only: data and subtitle codecs, and the
                     // audio codecs with AV_CODEC_PROP_INTRA_ONLY.
@@ -600,14 +614,19 @@ impl ParsedStream {
         // FFmpeg's H.264 and HEVC decoders find reaches the codec context,
         // and the AAC rate, channels and frame size.
         let decoding = !(self.had_parameters && self.decode_delay_guessed());
+        let unit = self.unit_pictures.pop_front().flatten();
         if decoding {
             if let Some((restriction, reorder)) = self.parser.h264_reorder() {
                 if restriction {
                     self.avctx.has_b_frames = self.avctx.has_b_frames.max(reorder);
                 }
-                if let Some(picture) = self.parser.h264_picture() {
+                if let Some((picture, key)) = unit {
                     self.output_order
                         .select(picture, &mut self.avctx.has_b_frames, restriction);
+                    self.recovered |= key || picture.idr;
+                    if self.recovered {
+                        self.decoded_pictures += 1;
+                    }
                 }
             }
             // export_stream_params: the HEVC decoder sets the depth.
@@ -645,7 +664,11 @@ impl ParsedStream {
         {
             return true;
         }
-        let decoded = self.nb_frames.saturating_sub(has_b_frames.max(0) as u64);
+        // nb_decoded_frames: the frames the decoder output, which lag the
+        // pictures decoded by the reorder depth (a field pair is one).
+        let decoded = self
+            .decoded_pictures
+            .saturating_sub(has_b_frames.max(0) as u64);
         match has_b_frames {
             ..=2 => decoded >= 7,
             3 => decoded >= 18,
@@ -729,6 +752,13 @@ fn parse_packet(
             queue,
             guessed,
         );
+        if probing && p.avctx.codec == Codec::H264 {
+            let picture = p
+                .parser
+                .h264_picture()
+                .map(|pic| (pic, p.parser.state.key_frame == 1));
+            p.unit_pictures.push_back(picture);
+        }
         queue.push_back(e);
     }
     Ok(())
