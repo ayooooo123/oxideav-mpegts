@@ -175,6 +175,9 @@ pub struct MpegTsDemuxer {
     /// Late PIDs whose PMT this read has not met yet: their PES are not
     /// delivered (FFmpeg has no PES filter for them until then).
     inactive: std::collections::HashSet<u16>,
+    /// The AC-3 stream an HDMV TrueHD PID also carries: its PES with
+    /// extended_stream_id 0x76 go there.
+    sub_streams: HashMap<u16, u32>,
 }
 
 /// Container facts about one reassembled PES.
@@ -445,6 +448,19 @@ impl MpegTsDemuxer {
         // and again after it seeks back (handle_packets resets every
         // section filter's last_ver), with what the first pass decided.
         let (order, mut identities) = pmt_identities(&pmt.streams, 2);
+        // prog_reg_desc: the program's last registration descriptor.
+        let prog_reg = pmt
+            .iter_program_descriptors()
+            .flatten()
+            .filter_map(|d| match d.body {
+                crate::DescriptorBody::Registration {
+                    format_identifier, ..
+                } => Some(format_identifier),
+                _ => None,
+            })
+            .last();
+        let hdmv = matches!(prog_reg.as_ref(), Some(b"HDMV" | b"HDPR"));
+        let mut sub_streams: HashMap<u16, u32> = HashMap::new();
         for pid in order {
             let (es, language) = identities.remove(&pid).expect("listed");
             let idx = streams.len() as u32;
@@ -478,6 +494,20 @@ impl MpegTsDemuxer {
             pts_trackers.insert(pid, PtsTracker::new());
             dts_trackers.insert(pid, PtsTracker::new());
             stream_types.insert(pid, es.stream_type);
+            // HDMV TrueHD carries an AC-3 version of the track on its PID
+            // (extended_stream_id 0x76): a second stream
+            // (mpegts_set_stream_info, mpegts.c:980-1002).
+            if hdmv && es.stream_type == 0x83 {
+                let sub = streams.len() as u32;
+                streams.push(StreamInfo {
+                    index: sub,
+                    time_base: tb,
+                    duration: None,
+                    start_time: None,
+                    params: CodecParameters::audio(CodecId::new("ac3")),
+                });
+                sub_streams.insert(pid, sub);
+            }
         }
         if streams.is_empty() {
             return Err(CoreError::invalid(
@@ -524,6 +554,7 @@ impl MpegTsDemuxer {
             noted: Vec::new(),
             late_pids: Vec::new(),
             inactive: std::collections::HashSet::new(),
+            sub_streams,
         };
 
         // Probe the container duration from the PCR span (§2.4.2.2).
@@ -1391,6 +1422,10 @@ impl MpegTsDemuxer {
         if pes.payload.is_empty() {
             return;
         }
+        let stream_idx = match self.sub_streams.get(&pid) {
+            Some(&sub) if extended_stream_id(&pes) == Some(0x76) => sub,
+            _ => stream_idx,
+        };
         let packet = self.finish_pes(pid, stream_idx, pes, pos);
         self.pending.push_back(packet);
     }
@@ -1457,7 +1492,7 @@ impl MpegTsDemuxer {
             self.pts_trackers.remove(&pid);
             self.dts_trackers.remove(&pid);
         }
-        for index in self.pid_to_stream.values_mut() {
+        for index in self.pid_to_stream.values_mut().chain(self.sub_streams.values_mut()) {
             *index = remap[index];
         }
         self.pending.retain_mut(|(packet, _)| match remap.get(&packet.stream_index) {
@@ -1952,6 +1987,18 @@ fn pmt_identities(
         identities.insert(pid, (es, language));
     }
     (order, identities)
+}
+
+/// The PES's extended_stream_id: the first byte of PES_extension_field_2
+/// when no pack header comes first and its stream_id_extension_flag is
+/// clear, as mpegts_push_data reads it.
+fn extended_stream_id(pes: &PesPacket) -> Option<u8> {
+    let ext = pes.pes_extension.as_ref()?;
+    if ext.pack_header.is_some() {
+        return None;
+    }
+    let first = *ext.extension_field_2.as_ref()?.first()?;
+    (first & 0x80 == 0).then_some(first)
 }
 
 /// A PSI section's CRC_32 field.

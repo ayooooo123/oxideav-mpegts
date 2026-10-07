@@ -14,7 +14,7 @@
 // It is distributed WITHOUT ANY WARRANTY; without even the implied warranty
 // of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See LICENSE-LGPL.
 
-use super::{aac_ac3, dca, h264, lcevc, mpegaudio, mpegvideo, opus};
+use super::{aac_ac3, dca, h264, lcevc, mlp, mpegaudio, mpegvideo, opus};
 
 /// AV_NOPTS_VALUE.
 pub(crate) const NOPTS: i64 = i64::MIN;
@@ -61,6 +61,7 @@ pub(crate) enum Codec {
     Eac3,
     Opus,
     Dts,
+    TrueHd,
     Lcevc,
 }
 
@@ -78,6 +79,7 @@ impl Codec {
             Codec::Eac3 => "eac3",
             Codec::Opus => "opus",
             Codec::Dts => "dts",
+            Codec::TrueHd => "truehd",
             Codec::Lcevc => "lcevc",
         }
     }
@@ -394,6 +396,27 @@ impl ParseContext {
     pub fn held(&self) -> usize {
         self.index
     }
+
+    /// The overread copy that starts ff_combine_frame: bytes a unit
+    /// that ended early left behind join the unit in progress.
+    pub fn move_overread(&mut self) {
+        while self.overread > 0 {
+            let b = self.buffer.get(self.overread_index).copied().unwrap_or(0);
+            self.put(self.index, b);
+            self.index += 1;
+            self.overread_index += 1;
+            self.overread -= 1;
+        }
+    }
+
+    /// `pc->buffer[at]` of the unit in progress (0 past what is held).
+    pub fn held_byte(&self, at: usize) -> u8 {
+        if at < self.index {
+            self.buffer.get(at).copied().unwrap_or(0)
+        } else {
+            0
+        }
+    }
 }
 
 /// The generic part of AVCodecParserContext: timestamp bookkeeping and
@@ -534,6 +557,7 @@ enum Kind {
     AacAc3(aac_ac3::AacAc3Parser),
     Opus(opus::OpusParser),
     Dca(dca::DcaParser),
+    Mlp(mlp::MlpParser),
     Lcevc(lcevc::LcevcParser),
 }
 
@@ -560,6 +584,7 @@ impl Parser {
             Codec::Ac3 | Codec::Eac3 => (Kind::AacAc3(aac_ac3::AacAc3Parser::ac3()), pict::I),
             Codec::Opus => (Kind::Opus(opus::OpusParser::new()), pict::I),
             Codec::Dts => (Kind::Dca(dca::DcaParser::new()), pict::I),
+            Codec::TrueHd => (Kind::Mlp(mlp::MlpParser::new()), pict::I),
             Codec::Lcevc => (Kind::Lcevc(lcevc::LcevcParser::new()), pict::I),
         };
         Self {
@@ -612,6 +637,7 @@ impl Parser {
             Kind::AacAc3(p) => p.parse(&mut self.state, avctx, buf)?,
             Kind::Opus(p) => p.parse(&mut self.state, avctx, buf)?,
             Kind::Dca(p) => p.parse(&mut self.state, avctx, buf)?,
+            Kind::Mlp(p) => p.parse(&mut self.state, avctx, buf)?,
             Kind::Lcevc(p) => p.parse(&mut self.state, avctx, buf)?,
         };
         let s = &mut self.state;

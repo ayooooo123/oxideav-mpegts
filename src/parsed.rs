@@ -184,6 +184,7 @@ fn parsed_codec(codec_id: &str, stream_type: Option<u8>) -> Option<Codec> {
         "eac3" => Codec::Eac3,
         "opus" => Codec::Opus,
         "dts" => Codec::Dts,
+        "truehd" => Codec::TrueHd,
         "lcevc" => Codec::Lcevc,
         _ => return None,
     })
@@ -639,6 +640,10 @@ fn parse_packet(
     let mut rai = info.random_access;
     let mut got_output = flush;
     let mut calls = 0usize;
+    // Calls in a row that took no input and gave no unit. FFmpeg calls
+    // again on the same bytes (the MLP parser does so once it has found
+    // a sync); none of its parsers stalls twice in a row.
+    let mut stalls = 0usize;
     while (!rest.is_empty() || (flush && got_output)) && calls < MAX_CALLS_PER_PES {
         calls += 1;
         let (next_pts, next_dts) = (pts, dts);
@@ -655,11 +660,13 @@ fn parse_packet(
         rest = &rest[len.min(rest.len())..];
         got_output = unit.is_some();
         let Some(data) = unit else {
-            if len == 0 {
+            stalls = if len == 0 { stalls + 1 } else { 0 };
+            if stalls > 2 {
                 break;
             }
             continue;
         };
+        stalls = 0;
         let s = &p.parser.state;
         let mut e = Pending {
             stream,

@@ -18,6 +18,7 @@ pub(crate) mod bits;
 pub(crate) mod dca;
 pub(crate) mod h264;
 pub(crate) mod lcevc;
+pub(crate) mod mlp;
 pub(crate) mod mpegaudio;
 pub(crate) mod mpegvideo;
 pub(crate) mod opus;

@@ -48,6 +48,9 @@
 //!   `dtshd_ma.ts`: FATE's `dts/master_audio_7.1_24bit.dts` remuxed by
 //!   `ffmpeg -t 0.3 -c copy -f mpegts` (a core and its DTS-HD extension
 //!   substream in each frame).
+//! - `truehd.ts`: FFmpeg-muxed stereo TrueHD (stream type 0x83).
+//!   `truehd_hdmv.m2ts`: the same muxed as an m2ts, whose PMT carries the
+//!   `HDMV` registration.
 
 mod common;
 
@@ -158,6 +161,20 @@ fn dts_frames_are_split_and_timed_as_ffmpeg_splits_them() {
         ..Want::any("dts", oxideav_core::MediaType::Audio)
     };
     assert_fixture("dtshd_ma.ts", &[dts_hd]);
+}
+
+#[test]
+fn truehd_access_units_are_split_and_timed_as_ffmpeg_splits_them() {
+    assert_fixture("truehd.ts", &[Want::audio("truehd", 48_000, 2)]);
+    // HDMV TrueHD carries an AC-3 version of the track on its PID
+    // (extended_stream_id 0x76); FFmpeg lists it as a second stream.
+    assert_fixture(
+        "truehd_hdmv.m2ts",
+        &[
+            Want::audio("truehd", 48_000, 2),
+            Want::any("ac3", oxideav_core::MediaType::Audio),
+        ],
+    );
 }
 
 #[test]
