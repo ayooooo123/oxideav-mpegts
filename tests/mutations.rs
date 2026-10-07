@@ -71,7 +71,7 @@ fn drain(demuxer: &mut dyn Demuxer, len: usize, mutant: usize) {
 
 #[test]
 fn mutated_streams_end_cleanly() {
-    mutate(TS, 2500, 0x7EA5_5EED_2DA5_5BF0);
+    mutate(TS, MUTANTS, 0x7EA5_5EED_2DA5_5BF0);
 }
 
 #[test]
