@@ -37,8 +37,8 @@
 use std::collections::{HashMap, VecDeque};
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, Demuxer, Error as CoreError, Packet, ReadSeek,
-    Result as CoreResult, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, Demuxer, Error as CoreError, Packet, PacketMetadata,
+    ReadSeek, Result as CoreResult, StreamInfo, TimeBase,
 };
 
 use crate::{
@@ -51,10 +51,15 @@ use crate::{
 const NULL_PID: u16 = 0x1FFF;
 
 /// Open factory matching `oxideav_core::OpenDemuxerFn`. Registered
-/// under the `"mpegts"` container name.
+/// under the `"mpegts"` container name. It demuxes as FFmpeg does: each
+/// elementary stream FFmpeg parses goes through the port of its codec
+/// parser ([`crate::parsed`]), so packets are access units with FFmpeg's
+/// timestamps, durations and keyframe flags, and the streams carry the
+/// parameters FFmpeg reports at open.
 pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> CoreResult<Box<dyn Demuxer>> {
     let _ = codecs; // stream_type → CodecId is hard-coded for MPEG-TS
-    MpegTsDemuxer::new(input).map(|d| Box::new(d) as Box<dyn Demuxer>)
+    let inner = MpegTsDemuxer::new(input)?;
+    crate::parsed::ParsedDemuxer::new(inner).map(|d| Box::new(d) as Box<dyn Demuxer>)
 }
 
 /// One program advertised by a transport stream's PAT — the
@@ -102,8 +107,18 @@ pub struct MpegTsDemuxer {
     /// `elementary_pid` → 33-bit DTS unwrapper — DTS advances
     /// independently of PTS so it needs its own ring tracker.
     dts_trackers: HashMap<u16, PtsTracker>,
-    /// Already-reassembled packets waiting to be handed out.
-    pending: VecDeque<Packet>,
+    /// `elementary_pid` → the PMT `stream_type` it was announced with.
+    stream_types: HashMap<u16, u8>,
+    /// Already-reassembled packets waiting to be handed out, each with
+    /// where its PES started and whether the container marked it as a
+    /// random-access point.
+    pending: VecDeque<(Packet, PesInfo)>,
+    /// `elementary_pid` → byte offset of the TS packet that started the
+    /// in-flight PES.
+    pes_start: HashMap<u16, u64>,
+    /// [`Demuxer::packet_metadata`] of the last packet returned; cleared
+    /// before every read and seek.
+    meta: PacketMetadata,
     /// `true` once `read_one_packet` has returned `Eof` and every
     /// reassembler has been flushed.
     eof_reached: bool,
@@ -141,6 +156,16 @@ pub struct MpegTsDemuxer {
     /// Every read strips the framing down to the logical 188-byte
     /// window.
     layout: crate::packet::TsPacketLayout,
+}
+
+/// Container facts about one reassembled PES.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PesInfo {
+    /// Byte offset of the TS packet the PES started in (FFmpeg's
+    /// `ts_packet_pos`).
+    pub pos: u64,
+    /// A `random_access_indicator` (§2.4.3.5) announced the PES.
+    pub random_access: bool,
 }
 
 /// How an access point announced itself on the wire — the two
@@ -206,7 +231,7 @@ impl std::fmt::Debug for MpegTsDemuxer {
 
 impl MpegTsDemuxer {
     /// Open a demuxer on the **first** program the PAT advertises.
-    fn new(input: Box<dyn ReadSeek>) -> CoreResult<Self> {
+    pub(crate) fn new(input: Box<dyn ReadSeek>) -> CoreResult<Self> {
         Self::with_selector(input, None)
     }
 
@@ -384,8 +409,23 @@ impl MpegTsDemuxer {
         let mut reassemblers: HashMap<u16, PesReassembler> = HashMap::new();
         let mut pts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
         let mut dts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
+        let mut stream_types: HashMap<u16, u8> = HashMap::new();
         for pmt_stream in &pmt.streams {
             let idx = streams.len() as u32;
+            // A PID the PMT lists again keeps its stream: a later entry
+            // that names a codec replaces the earlier one, one that does
+            // not leaves it (libavformat/mpegts.c pmt_cb reuses the PID's
+            // stream and restores the old codec when none is found).
+            if let Some(&existing) = pid_to_stream.get(&pmt_stream.elementary_pid) {
+                if let Some(mut params) = codec_params_for_pmt_stream(pmt_stream) {
+                    let info = &mut streams[existing as usize];
+                    params.language = first_iso639_language(pmt_stream).or(info.params.language.take());
+                    info.params = params;
+                    provisional.retain(|&p| p != existing);
+                    stream_types.insert(pmt_stream.elementary_pid, pmt_stream.stream_type);
+                }
+                continue;
+            }
             let mut params = match codec_params_for_pmt_stream(pmt_stream) {
                 Some(p) => p,
                 None if private_payload_decides(pmt_stream) => {
@@ -417,6 +457,7 @@ impl MpegTsDemuxer {
             reassemblers.insert(pmt_stream.elementary_pid, PesReassembler::new());
             pts_trackers.insert(pmt_stream.elementary_pid, PtsTracker::new());
             dts_trackers.insert(pmt_stream.elementary_pid, PtsTracker::new());
+            stream_types.insert(pmt_stream.elementary_pid, pmt_stream.stream_type);
         }
         if streams.is_empty() {
             return Err(CoreError::invalid(
@@ -425,6 +466,14 @@ impl MpegTsDemuxer {
             ));
         }
 
+        // Demuxing starts over at the first packet, as FFmpeg's
+        // mpegts_read_header seeks back once the service scan has found
+        // the PMT (libavformat/mpegts.c: seek_back after handle_packets):
+        // PES that began before the PAT / PMT on the elementary PIDs are
+        // delivered, not dropped.
+        input
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(CoreError::Io)?;
         let mut demuxer = Self {
             input,
             programs,
@@ -436,10 +485,13 @@ impl MpegTsDemuxer {
             reassemblers,
             pts_trackers,
             dts_trackers,
+            stream_types,
             pending: VecDeque::new(),
+            pes_start: HashMap::new(),
+            meta: PacketMetadata::default(),
             eof_reached: false,
-            bytes_read: probe_bytes,
-            putback: probe_putback,
+            bytes_read: 0,
+            putback: VecDeque::new(),
             duration_micros: None,
             first_pcr: None,
             last_pcr: None,
@@ -450,9 +502,8 @@ impl MpegTsDemuxer {
         // Probe the container duration from the PCR span (§2.4.2.2).
         // This seeks the input to its end and back; restore the
         // streaming cursor afterwards so the first `next_packet`
-        // resumes exactly where the header scan stopped. A
-        // non-seekable source (or one too short to carry two PCRs)
-        // leaves `duration_micros` at `None`.
+        // starts at the stream head. A non-seekable source (or one too
+        // short to carry two PCRs) leaves `duration_micros` at `None`.
         demuxer.duration_micros = demuxer.compute_duration_micros();
         let _ = demuxer
             .input
@@ -1115,6 +1166,8 @@ impl MpegTsDemuxer {
         self.bytes_read = offset;
         self.putback.clear();
         self.pending.clear();
+        self.pes_start.clear();
+        self.meta = PacketMetadata::default();
         self.eof_reached = false;
         self.pcr_tracker.reset();
         for r in self.reassemblers.values_mut() {
@@ -1179,9 +1232,12 @@ impl MpegTsDemuxer {
     /// Unwrap a freshly reassembled PES into a [`Packet`], carrying the
     /// monotonic 64-bit extended PTS/DTS (§2.4.3.7) rather than the raw
     /// 33-bit ring value, and record the stream's `start_time` on its
-    /// first timestamped packet.
-    fn finish_pes(&mut self, pid: u16, stream_idx: u32, pes: PesPacket) -> Packet {
+    /// first timestamped packet. A PES that codes only a PTS decodes at
+    /// it (`PTS_DTS_flags` '10': DTS = PTS, as libavformat/mpegts.c sets
+    /// it). `pos` is where the PES started.
+    fn finish_pes(&mut self, pid: u16, stream_idx: u32, pes: PesPacket, pos: u64) -> (Packet, PesInfo) {
         let tb = TimeBase::new(1, 90_000);
+        let info = PesInfo { pos, random_access: pes.random_access };
         let mut pkt = Packet::new(stream_idx, tb, pes.payload);
         // A TS-level random_access_indicator (§2.4.3.5) announced this
         // PES as beginning at an elementary-stream access point — the
@@ -1224,8 +1280,10 @@ impl MpegTsDemuxer {
                 raw
             };
             pkt = pkt.with_dts(ext as i64);
+        } else if let Some(pts) = pkt.pts {
+            pkt = pkt.with_dts(pts);
         }
-        pkt
+        (pkt, info)
     }
 
     /// Feed a TS packet's adaptation field into the PCR clock recovery
@@ -1264,13 +1322,28 @@ impl MpegTsDemuxer {
         let Some(stream_idx) = self.pid_to_stream.get(&pkt.pid).copied() else {
             return Ok(true);
         };
+        let started = self.pes_start.get(&pkt.pid).copied().unwrap_or(pkt_offset);
+        if pkt.payload_unit_start {
+            self.pes_start.insert(pkt.pid, pkt_offset);
+        }
         let reassembler = self
             .reassemblers
             .get_mut(&pkt.pid)
             .expect("pid_to_stream and reassemblers are kept in sync");
         if let Some(pes) = reassembler.feed(&pkt).map_err(map_ts_err)? {
-            let packet = self.finish_pes(pkt.pid, stream_idx, pes);
+            let packet = self.finish_pes(pkt.pid, stream_idx, pes, started);
             self.pending.push_back(packet);
+        }
+        // A PES that states its length is complete with its last byte,
+        // where FFmpeg's mpegts_push_data emits it, rather than at the
+        // PID's next unit start.
+        let reassembler = self.reassemblers.get_mut(&pkt.pid).expect("fed above");
+        if reassembler.is_complete() {
+            if let Some(pes) = reassembler.flush().map_err(map_ts_err)? {
+                let pos = self.pes_start.get(&pkt.pid).copied().unwrap_or(pkt_offset);
+                let packet = self.finish_pes(pkt.pid, stream_idx, pes, pos);
+                self.pending.push_back(packet);
+            }
         }
         Ok(true)
     }
@@ -1291,7 +1364,7 @@ impl MpegTsDemuxer {
             && self.bytes_read - start < PRIVATE_PROBE_TS_BYTES
         {
             self.pump()?;
-            while let Some(packet) = self.pending.get(examined) {
+            while let Some((packet, _)) = self.pending.get(examined) {
                 examined += 1;
                 let index = packet.stream_index;
                 if decided.contains_key(&index) {
@@ -1340,7 +1413,7 @@ impl MpegTsDemuxer {
         for index in self.pid_to_stream.values_mut() {
             *index = remap[index];
         }
-        self.pending.retain_mut(|packet| match remap.get(&packet.stream_index) {
+        self.pending.retain_mut(|(packet, _)| match remap.get(&packet.stream_index) {
             Some(&index) => {
                 packet.stream_index = index;
                 true
@@ -1354,7 +1427,8 @@ impl MpegTsDemuxer {
     /// dry. Pushes a final `Packet` per stream that had a buffered
     /// in-flight PES at end-of-stream.
     fn flush_reassemblers(&mut self) {
-        let pids: Vec<u16> = self.reassemblers.keys().copied().collect();
+        let mut pids: Vec<u16> = self.reassemblers.keys().copied().collect();
+        pids.sort_unstable();
         for pid in pids {
             let stream_idx = self.pid_to_stream[&pid];
             let flushed = self
@@ -1362,10 +1436,41 @@ impl MpegTsDemuxer {
                 .get_mut(&pid)
                 .and_then(|r| r.flush().ok().flatten());
             if let Some(pes) = flushed {
-                let packet = self.finish_pes(pid, stream_idx, pes);
+                let pos = self.pes_start.get(&pid).copied().unwrap_or(self.bytes_read);
+                let packet = self.finish_pes(pid, stream_idx, pes, pos);
                 self.pending.push_back(packet);
             }
         }
+    }
+
+    /// The next reassembled PES with its container facts: what
+    /// [`crate::parsed::ParsedDemuxer`] parses.
+    pub(crate) fn next_pes(&mut self) -> CoreResult<(Packet, PesInfo)> {
+        loop {
+            if let Some(pes) = self.pending.pop_front() {
+                return Ok(pes);
+            }
+            if self.eof_reached {
+                return Err(CoreError::Eof);
+            }
+            self.pump()?;
+        }
+    }
+
+    /// Start demuxing over from the first packet with fresh PES and
+    /// timestamp state (FFmpeg's estimate_timings_from_pts seek back).
+    pub(crate) fn rewind(&mut self) -> CoreResult<()> {
+        self.input
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(CoreError::Io)?;
+        self.reposition(0, None);
+        Ok(())
+    }
+
+    /// The PMT `stream_type` of stream `index`.
+    pub(crate) fn stream_type(&self, index: u32) -> Option<u8> {
+        let pid = self.pid_to_stream.iter().find_map(|(&pid, &i)| (i == index).then_some(pid))?;
+        self.stream_types.get(&pid).copied()
     }
 }
 
@@ -1392,6 +1497,7 @@ impl Demuxer for MpegTsDemuxer {
         // stream that signals no access points at all degrades to the
         // PCR-granular landing, which still positions at or before the
         // target so the caller can decode forward.
+        self.meta = PacketMetadata::default();
         match self.seek_to_access_point(stream_index, pts) {
             Ok(landed) => Ok(landed),
             Err(CoreError::Unsupported(_)) => self.seek_by_pcr(pts),
@@ -1399,16 +1505,15 @@ impl Demuxer for MpegTsDemuxer {
         }
     }
 
+    fn packet_metadata(&self) -> PacketMetadata {
+        self.meta.clone()
+    }
+
     fn next_packet(&mut self) -> CoreResult<Packet> {
-        loop {
-            if let Some(pkt) = self.pending.pop_front() {
-                return Ok(pkt);
-            }
-            if self.eof_reached {
-                return Err(CoreError::Eof);
-            }
-            self.pump()?;
-        }
+        self.meta = PacketMetadata::default();
+        let (pkt, info) = self.next_pes()?;
+        self.meta.container_keyframe = info.random_access;
+        Ok(pkt)
     }
 }
 
@@ -1432,9 +1537,10 @@ const MAX_PHYSICAL_PACKET: usize = 204;
 /// Drains from `putback` first (used by the resync path to feed peeked
 /// bytes back to the caller) and then from `input`.
 ///
-/// Returns `Ok(None)` cleanly when fewer than a packet's bytes remain —
-/// the caller treats that as end-of-stream. A short read mid-packet
-/// (e.g. the stream is truncated) surfaces as `Err`.
+/// Returns `Ok(None)` when fewer than a packet's bytes remain — the
+/// caller treats that as end-of-stream, a truncated last packet
+/// included, as FFmpeg's `read_packet` turns a short read into
+/// `AVERROR_EOF` (libavformat/mpegts.c).
 ///
 /// On a sync-byte mismatch we **resync** by discarding packet-sized
 /// chunks until we find one with `0x47` at the layout's sync offset
@@ -1464,20 +1570,14 @@ fn read_one_packet(
     }
     while filled < psize {
         match input.read(&mut buf[filled..psize]) {
-            Ok(0) => {
-                if filled == 0 {
-                    return Ok(None);
-                }
-                return Err(CoreError::invalid(format!(
-                    "mpegts: short read at packet boundary ({filled}/{psize} bytes, offset {bytes_read})"
-                )));
-            }
+            Ok(0) => return Ok(None),
             Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(CoreError::Io(e)),
         }
     }
     if buf[layout.sync_offset] != TS_SYNC_BYTE {
-        return resync(input, putback, buf[layout.sync_offset], bytes_read, layout).map(Some);
+        return resync(input, putback, buf[layout.sync_offset], bytes_read, layout);
     }
     let mut out = [0u8; TS_PACKET_LEN];
     out.copy_from_slice(layout.window(&buf));
@@ -1494,7 +1594,8 @@ fn read_one_packet(
 /// We don't try to recover the failing packet itself; we just skip it
 /// (and any further failing chunks) until a clean packet boundary
 /// appears. After at most [`RESYNC_PACKET_LIMIT`] failed chunks,
-/// surface as `Err`.
+/// surface as `Err`. Running out of input while resyncing is the end of
+/// the stream (`Ok(None)`), as in FFmpeg's `mpegts_resync`.
 ///
 /// `bad_byte` is the byte that failed the sync check, kept for
 /// diagnostics.
@@ -1504,7 +1605,7 @@ fn resync(
     bad_byte: u8,
     bytes_read: u64,
     layout: crate::packet::TsPacketLayout,
-) -> CoreResult<[u8; TS_PACKET_LEN]> {
+) -> CoreResult<Option<[u8; TS_PACKET_LEN]>> {
     use std::io::Read;
     let psize = layout.packet_size;
     let mut buf = [0u8; MAX_PHYSICAL_PACKET];
@@ -1517,13 +1618,9 @@ fn resync(
         let mut filled = 0;
         while filled < psize {
             match input.read(&mut buf[filled..psize]) {
-                Ok(0) => {
-                    return Err(CoreError::invalid(format!(
-                        "mpegts: bad sync byte 0x{bad_byte:02X} at offset {bytes_read} \
-                         and EOF reached during resync"
-                    )));
-                }
+                Ok(0) => return Ok(None),
                 Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(CoreError::Io(e)),
             }
         }
@@ -1551,7 +1648,7 @@ fn resync(
             // truncated tail and are dropped).
             let mut out = [0u8; TS_PACKET_LEN];
             out.copy_from_slice(layout.window(&buf));
-            return Ok(out);
+            return Ok(Some(out));
         }
         if probe[probe_len - 1] == TS_SYNC_BYTE {
             // Push the probed bytes back so the next call sees them as
@@ -1561,7 +1658,7 @@ fn resync(
             }
             let mut out = [0u8; TS_PACKET_LEN];
             out.copy_from_slice(layout.window(&buf));
-            return Ok(out);
+            return Ok(Some(out));
         }
         // Single 0x47 not confirmed by a sync one stride later; treat
         // as coincidence inside garbage data and keep scanning. The
@@ -1673,7 +1770,14 @@ fn first_iso639_language(pmt_stream: &crate::PmtStream) -> Option<String> {
 /// DTS audio is named by the DVB DTS_descriptor (tag 0x7B, ETSI EN 300
 /// 468 annex G) or a registration descriptor with one of the SMPTE-RA
 /// format identifiers `DTS1`/`DTS2`/`DTS3` (512/1024/2048-sample frames).
+/// AC-3 and E-AC-3 are named by the DVB AC-3 (0x6A) and enhanced AC-3
+/// (0x7A) descriptors or the `AC-3` / `EAC3` registrations, as FFmpeg's
+/// DESC_types and REGD_types read them; stream type 0x87 is ATSC E-AC-3
+/// (MISC_types).
 fn codec_params_for_pmt_stream(stream: &crate::PmtStream) -> Option<CodecParameters> {
+    if stream.stream_type == 0x87 {
+        return Some(CodecParameters::audio(CodecId::new("eac3")));
+    }
     if stream.stream_type != 0x06 {
         return codec_params_for_stream_type(stream.stream_type);
     }
@@ -1705,6 +1809,14 @@ fn codec_params_for_pmt_stream(stream: &crate::PmtStream) -> Option<CodecParamet
                 format_identifier: [b'D', b'T', b'S', b'1'..=b'3'],
                 ..
             } => return Some(CodecParameters::audio(CodecId::new("dts"))),
+            crate::DescriptorBody::Ac3(_)
+            | crate::DescriptorBody::Registration { format_identifier: [b'A', b'C', b'-', b'3'], .. } => {
+                return Some(CodecParameters::audio(CodecId::new("ac3")))
+            }
+            crate::DescriptorBody::EnhancedAc3(_)
+            | crate::DescriptorBody::Registration { format_identifier: [b'E', b'A', b'C', b'3'], .. } => {
+                return Some(CodecParameters::audio(CodecId::new("eac3")))
+            }
             _ => {}
         }
     }
@@ -3382,5 +3494,37 @@ mod tests {
         assert_eq!((packet.stream_index, packet.pts), (0, Some(7777)));
         assert_eq!(packet.data, b"h264 access unit");
         assert!(matches!(demux.next_packet(), Err(CoreError::Eof)));
+    }
+
+    #[test]
+    fn ac3_family_descriptors_registrations_and_atsc_type_name_the_codec() {
+        // FFmpeg's DESC_types and REGD_types for private PES, and its
+        // MISC_types entry for ATSC E-AC-3 (stream type 0x87).
+        let cases: [(u8, &[u8], &str); 5] = [
+            (0x06, &[0x6A, 1, 0], "ac3"),
+            (0x06, &[0x05, 4, b'A', b'C', b'-', b'3'], "ac3"),
+            (0x06, &[0x7A, 1, 0], "eac3"),
+            (0x06, &[0x05, 4, b'E', b'A', b'C', b'3'], "eac3"),
+            (0x87, &[], "eac3"),
+        ];
+        for (stream_type, descriptors, codec) in cases {
+            let stream = crate::PmtStream { stream_type, elementary_pid: 0x101, descriptors: descriptors.to_vec() };
+            let params = codec_params_for_pmt_stream(&stream);
+            assert_eq!(params.as_ref().map(|p| p.codec_id.as_str()), Some(codec), "{stream_type:#04x} {descriptors:02x?}");
+        }
+    }
+
+    #[test]
+    fn a_pid_listed_again_takes_the_later_codec() {
+        // FATE's ac3/mp3ac325-4864-small.ts lists its audio PID as MPEG
+        // audio and again as private PES with an AC-3 descriptor; FFmpeg
+        // keeps one stream for the PID, with the later codec.
+        let mut bytes = pat_pmt_with(&[(0x1B, 0x102, &[]), (0x04, 0x101, &[]), (0x06, 0x101, &[0x6A, 1, 0])]);
+        bytes.extend(private_pes_packets(0x101, &[vec![0x0B, 0x77, 0, 0]], &mut 0));
+        let mut demux = MpegTsDemuxer::new(Box::new(Cursor::new(bytes))).unwrap();
+        let codecs: Vec<&str> = demux.streams().iter().map(|s| s.params.codec_id.as_str()).collect();
+        assert_eq!(codecs, ["h264", "ac3"]);
+        let packet = demux.next_packet().unwrap();
+        assert_eq!((packet.stream_index, packet.data.as_slice()), (1, &[0x0B, 0x77, 0, 0][..]));
     }
 }

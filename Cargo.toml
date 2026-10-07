@@ -3,9 +3,9 @@ name = "oxideav-mpegts"
 version = "0.0.3"
 edition = "2021"
 rust-version = "1.80"
-license = "MIT"
+license = "MIT AND LGPL-2.1-or-later"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust clean-room MPEG-TS (ISO/IEC 13818-1) demuxer — 188-byte TS packet parser, PAT/PMT discovery, PES reassembly. Built to ingest Blu-ray .m2ts bytes for remux pipelines."
+description = "Pure-Rust MPEG-TS (ISO/IEC 13818-1) demuxer — 188-byte TS packet parser, PAT/PMT discovery, PES reassembly, and FFmpeg's parser stage (LGPL port) for access-unit packets. Built to ingest Blu-ray .m2ts bytes for remux pipelines."
 repository = "https://github.com/OxideAV/oxideav-mpegts"
 homepage = "https://github.com/OxideAV/oxideav-mpegts"
 readme = "README.md"
@@ -23,3 +23,8 @@ registry = ["dep:oxideav-core"]
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }
 thiserror = "2"
+
+# PacketMetadata and Demuxer::packet_metadata come from the PearTube core
+# fork (the media workspace patches the same revision).
+[patch.crates-io]
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "96094a916d8b9f2695f70bb0d53e5956b8a79847" }

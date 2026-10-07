@@ -2058,9 +2058,16 @@ fn stream_type_for_codec(codec_id: &str) -> Option<(u8, u8, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::{CodecId, CodecParameters, ReadSeek, TimeBase};
+    use oxideav_core::{CodecId, CodecParameters, Demuxer, ReadSeek, TimeBase};
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
+
+    /// The PES-level demuxer. These round trips check the mux layer
+    /// (PES framing, RAI, T-STD, splices); the registry `open()` adds
+    /// FFmpeg's parser stage, which re-splits synthetic payloads.
+    fn pes_demuxer(bytes: Vec<u8>) -> crate::demuxer::MpegTsDemuxer {
+        crate::demuxer::MpegTsDemuxer::new(Box::new(Cursor::new(bytes))).expect("dmx open")
+    }
 
     fn stream_info(idx: u32, codec_id: &str, is_video: bool) -> StreamInfo {
         let params = if is_video {
@@ -2185,9 +2192,7 @@ mod tests {
         let bytes = sink.into_bytes();
         assert!(bytes.len() % TS_PACKET_LEN == 0);
 
-        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-        let resolver = oxideav_core::NullCodecResolver;
-        let mut dmx = crate::demuxer::open(input, &resolver).expect("dmx open");
+        let mut dmx = pes_demuxer(bytes);
         let codecs: Vec<&str> = dmx
             .streams()
             .iter()
@@ -3001,9 +3006,7 @@ mod tests {
         );
 
         // Demux check: keyframe flags survive the round trip.
-        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-        let resolver = oxideav_core::NullCodecResolver;
-        let mut dmx = crate::demuxer::open(input, &resolver).expect("dmx open");
+        let mut dmx = pes_demuxer(bytes);
         let mut flags_by_pts = std::collections::HashMap::new();
         while let Ok(p) = dmx.next_packet() {
             flags_by_pts.insert(p.pts.unwrap(), p.is_keyframe());
@@ -3815,9 +3818,7 @@ mod tests {
         );
 
         // Demux round-trip: exact PTS + payload sizes.
-        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-        let resolver = oxideav_core::NullCodecResolver;
-        let mut dmx = crate::demuxer::open(input, &resolver).expect("dmx open");
+        let mut dmx = pes_demuxer(bytes);
         let mut got: Vec<(i64, usize)> = Vec::new();
         while let Ok(p) = dmx.next_packet() {
             got.push((p.pts.unwrap(), p.data.len()));
@@ -4166,9 +4167,7 @@ mod tests {
         // Conformance + demux round-trip are unaffected.
         let report = crate::validate::validate_ts(&bytes);
         assert!(report.is_conformant(), "{report:?}");
-        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-        let resolver = oxideav_core::NullCodecResolver;
-        let mut dmx = crate::demuxer::open(input, &resolver).expect("dmx open");
+        let mut dmx = pes_demuxer(bytes);
         let p1 = dmx.next_packet().expect("p1");
         let p2 = dmx.next_packet().expect("p2");
         assert_eq!(p1.data, vec![0xAB; 1000]);
@@ -4504,9 +4503,7 @@ mod tests {
     /// `(stream_index, pts, payload, keyframe)` records, in demux
     /// order.
     fn demux_all(bytes: Vec<u8>) -> Vec<(u32, i64, Vec<u8>, bool)> {
-        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-        let resolver = oxideav_core::NullCodecResolver;
-        let mut dmx = crate::demuxer::open(input, &resolver).expect("dmx open");
+        let mut dmx = pes_demuxer(bytes);
         let mut out = Vec::new();
         while let Ok(p) = dmx.next_packet() {
             out.push((p.stream_index, p.pts.unwrap(), p.data, p.flags.keyframe));

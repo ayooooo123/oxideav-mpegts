@@ -933,6 +933,16 @@ impl PesReassembler {
         Ok(())
     }
 
+    /// The buffered PES states a length and holds all of it.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.started
+            && self.buf.len() >= 6
+            && match usize::from(u16::from_be_bytes([self.buf[4], self.buf[5]])) {
+                0 => false,
+                declared => self.buf.len() == 6 + declared,
+            }
+    }
+
     /// Drain the buffered PES packet (call at end-of-stream).
     pub fn flush(&mut self) -> Result<Option<PesPacket>, TsError> {
         if !self.started {

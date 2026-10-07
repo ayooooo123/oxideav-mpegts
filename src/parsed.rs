@@ -1,0 +1,560 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Port of FFmpeg 2da55bf libavformat/demux.c: parse_packet, the parser path
+// of read_frame_internal and av_read_frame, avformat_find_stream_info's
+// read-ahead (its probesize / analyzeduration limits and the codec context
+// the decoders it opens report) and estimate_timings_from_pts (the packet
+// queue flushed, parsers closed and the input read again from the start),
+// ff_read_frame_flush / ff_update_cur_dts on seek; with libavformat/mpegts.c's
+// stream setup (every PES stream is parsed with AVSTREAM_PARSE_FULL; stream
+// types 0x03 and 0x04 start as MP3; AVFMTCTX_NOHEADER).
+// Copyright (c) 2000-2003 Fabrice Bellard
+//
+// This file is free software; you can redistribute it and/or modify it under
+// the terms of the GNU Lesser General Public License as published by the Free
+// Software Foundation; either version 2.1, or (at your option) any later version.
+// It is distributed WITHOUT ANY WARRANTY; without even the implied warranty
+// of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See LICENSE-LGPL.
+
+//! The demuxer the `"mpegts"` container registration returns: packets as
+//! FFmpeg's `av_read_frame` returns them for a transport stream.
+//!
+//! H.264, MPEG-1/2 video, MPEG audio, AC-3 / E-AC-3 and ADTS AAC streams
+//! go through ports of FFmpeg's codec parsers: one packet per access unit,
+//! with FFmpeg's timestamps (PES timestamps fetched for the unit that
+//! starts in the PES, the rest interpolated), durations and keyframe
+//! flags. The transport stream's own random-access indicator rides
+//! [`PacketMetadata::container_keyframe`] on the unit that starts in the
+//! announced PES. Streams FFmpeg has no port for here pass through as
+//! PES payloads.
+//!
+//! Opening reads ahead as `avformat_find_stream_info` does (at most
+//! FFmpeg's 5 MB probe size or about five seconds), which establishes
+//! each parsed stream's parameters (size, pixel format and frame rate;
+//! sample rate, channels and the codec the headers name) and the codec
+//! state its packets are timed with. Then, as FFmpeg's
+//! `estimate_timings_from_pts` does for a seekable transport stream, the
+//! read-ahead's packets are dropped and demuxing starts over at the first
+//! byte with fresh parsers: the first packets are timed with what the
+//! read-ahead learnt (a frame rate stated only in a later SPS, an AAC
+//! frame size only the decoder knows).
+
+use std::collections::VecDeque;
+
+use oxideav_core::{
+    CodecId, Demuxer, Error as CoreError, MediaType, Packet, PacketMetadata, PixelFormat, Rational,
+    Result as CoreResult, StreamInfo, TimeBase,
+};
+
+use crate::demuxer::{MpegTsDemuxer, PesInfo};
+use crate::ff::parser::{
+    is_relative, pict, rescale, rescale_rnd, Codec, CodecCtx, Parser, PixFmt, Rnd, NOPTS,
+    RELATIVE_TS_BASE,
+};
+use crate::ff::timing::{Pending, StreamTiming};
+
+/// avformat_find_stream_info's default probesize: payload bytes the
+/// read-ahead returns.
+const PROBE_BYTES: u64 = 5_000_000;
+/// max_analyze_duration once every stream is analyzed (5 s).
+const ANALYZE_ALL_US: i64 = 5_000_000;
+/// max_stream_analyze_duration for "mpegts" (7 s).
+const ANALYZE_STREAM_US: i64 = 7_000_000;
+/// fps_analyze_framecount: H.264 and MPEG-2 time bases are unreliable.
+const FPS_ANALYZE_FRAMES: u64 = 20;
+/// max_ts_probe: units a stream may yield without a timestamp.
+const MAX_TS_PROBE: u64 = 50;
+/// Parser calls one PES may take: each call consumes input or returns a
+/// held unit, so this only bounds a parser bug, not real input.
+const MAX_CALLS_PER_PES: usize = 1 << 20;
+
+/// The parser stage of one stream.
+struct ParsedStream {
+    parser: Parser,
+    avctx: CodecCtx,
+    timing: StreamTiming,
+    /// codec_info_nb_frames: units find_stream_info has decoded.
+    nb_frames: u64,
+    /// codec_info_duration, in 90 kHz units.
+    info_duration: i64,
+    fps_first_dts: i64,
+    fps_last_dts: i64,
+}
+
+enum Stage {
+    /// No parser: PES payloads as they are. `intra_only` is
+    /// ff_is_intra_only for the codec (subtitles, DTS, PCM): those
+    /// packets are keyframes; the rest keep the container's indicator.
+    /// `seen` records whether the read-ahead met a packet.
+    Raw {
+        intra_only: bool,
+        seen: bool,
+    },
+    Parsed(Box<ParsedStream>),
+}
+
+/// The FFmpeg codec whose parser a stream goes through, if ported.
+fn parsed_codec(codec_id: &str, stream_type: Option<u8>) -> Option<Codec> {
+    Some(match codec_id {
+        "h264" => Codec::H264,
+        // ISO_types: both MPEG video stream types start as MPEG-2; the
+        // parser names MPEG-1 from a sequence header without extension.
+        "mpeg1video" | "mpeg2video" => Codec::Mpeg2Video,
+        // ISO_types: MPEG-1 and MPEG-2 audio are AV_CODEC_ID_MP3 until
+        // the parser reads a frame header's layer.
+        "mp1" | "mp2" | "mp3" => Codec::Mp3,
+        // Only ADTS carries the sync words the aac parser splits on.
+        "aac" if stream_type == Some(0x0F) => Codec::Aac,
+        "ac3" => Codec::Ac3,
+        "eac3" => Codec::Eac3,
+        _ => return None,
+    })
+}
+
+fn pixel_format(fmt: PixFmt) -> Option<PixelFormat> {
+    Some(match fmt {
+        PixFmt::Yuv420p => PixelFormat::Yuv420P,
+        PixFmt::Yuv422p => PixelFormat::Yuv422P,
+        PixFmt::Yuv444p => PixelFormat::Yuv444P,
+        PixFmt::Yuv420p10 => PixelFormat::Yuv420P10Le,
+        PixFmt::Yuv422p10 => PixelFormat::Yuv422P10Le,
+        PixFmt::Yuv444p10 => PixelFormat::Yuv444P10Le,
+        PixFmt::Yuv420p9 | PixFmt::Yuv422p9 | PixFmt::Yuv444p9 => return None,
+    })
+}
+
+/// MPEG-TS demuxed as FFmpeg demuxes it. See the module documentation.
+pub struct ParsedDemuxer {
+    inner: MpegTsDemuxer,
+    streams: Vec<StreamInfo>,
+    stages: Vec<Stage>,
+    /// FFmpeg's packet_buffer and parse_queue: packets not yet returned.
+    queue: VecDeque<Pending>,
+    meta: PacketMetadata,
+    eof: bool,
+    /// Inside the open-time read-ahead (find_stream_info).
+    probing: bool,
+    /// A read error met during the read-ahead of an input that cannot
+    /// be read again, returned after the packets read before it.
+    deferred: Option<CoreError>,
+}
+
+impl std::fmt::Debug for ParsedDemuxer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParsedDemuxer")
+            .field("streams", &self.streams.len())
+            .field("queued", &self.queue.len())
+            .field("eof", &self.eof)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ParsedDemuxer {
+    /// Wrap an opened [`MpegTsDemuxer`]: read ahead for the stream
+    /// parameters, then start over at the first byte.
+    pub fn new(inner: MpegTsDemuxer) -> CoreResult<Self> {
+        let streams = inner.streams().to_vec();
+        let stages = streams
+            .iter()
+            .map(
+                |s| match parsed_codec(s.params.codec_id.as_str(), inner.stream_type(s.index)) {
+                    Some(codec) => Stage::Parsed(Box::new(ParsedStream {
+                        parser: Parser::new(codec),
+                        avctx: CodecCtx::new(codec),
+                        timing: StreamTiming::new(),
+                        nb_frames: 0,
+                        info_duration: 0,
+                        fps_first_dts: NOPTS,
+                        fps_last_dts: NOPTS,
+                    })),
+                    None => Stage::Raw {
+                        intra_only: s.params.media_type == MediaType::Subtitle
+                            || s.params.codec_id.as_str() == "dts"
+                            || s.params.codec_id.as_str().starts_with("pcm_"),
+                        seen: false,
+                    },
+                },
+            )
+            .collect();
+        let mut d = Self {
+            inner,
+            streams,
+            stages,
+            queue: VecDeque::new(),
+            meta: PacketMetadata::default(),
+            eof: false,
+            probing: true,
+            deferred: None,
+        };
+        d.find_stream_info();
+        d.apply_parameters();
+        d.probing = false;
+        // estimate_timings_from_pts. An input that cannot seek back keeps
+        // the read-ahead's packets, as FFmpeg does for an unseekable one.
+        if d.inner.rewind().is_ok() {
+            d.queue.clear();
+            d.deferred = None;
+            d.eof = false;
+            for stage in &mut d.stages {
+                if let Stage::Parsed(p) = stage {
+                    p.parser = Parser::new(p.avctx.codec);
+                    p.timing.restart();
+                }
+            }
+        }
+        Ok(d)
+    }
+
+    /// The read-ahead, until the probe size, the analyze duration, the
+    /// end of input, or a read error.
+    fn find_stream_info(&mut self) {
+        let mut read_size = 0u64;
+        while !self.eof && read_size < PROBE_BYTES {
+            let before = self.queue.len();
+            if let Err(e) = self.read_pes() {
+                self.deferred = Some(e);
+                return;
+            }
+            // The units just queued, returned one by one as
+            // read_frame_internal returns them.
+            for at in before..self.queue.len() {
+                let (stream, size, dts, duration) = {
+                    let e = &self.queue[at];
+                    (e.stream as usize, e.data.len() as u64, e.dts, e.duration)
+                };
+                read_size += size;
+                let all = self.analyzed_all();
+                match self.stages.get_mut(stream) {
+                    Some(Stage::Raw { seen, .. }) => *seen = true,
+                    Some(Stage::Parsed(p)) => {
+                        if !p.returned(dts, duration, all) {
+                            return;
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// Every stream passes find_stream_info's per-stream checks.
+    fn analyzed_all(&self) -> bool {
+        self.stages.iter().all(|stage| match stage {
+            Stage::Raw { seen, .. } => *seen,
+            Stage::Parsed(p) => p.analyzed(),
+        })
+    }
+
+    /// What the streams state after the read-ahead, as find_stream_info
+    /// leaves it in codecpar.
+    fn apply_parameters(&mut self) {
+        for (info, stage) in self.streams.iter_mut().zip(&self.stages) {
+            let Stage::Parsed(p) = stage else { continue };
+            let params = &mut info.params;
+            params.codec_id = CodecId::new(p.avctx.codec.name());
+            if p.avctx.codec.is_video() {
+                if p.avctx.width > 0 && p.avctx.height > 0 {
+                    params.width = Some(p.avctx.width as u32);
+                    params.height = Some(p.avctx.height as u32);
+                }
+                if let Some(fmt) = p.parser.state.format.and_then(pixel_format) {
+                    params.pixel_format = Some(fmt);
+                }
+                let fr = p.avctx.framerate;
+                if fr.num > 0 && fr.den > 0 {
+                    params.frame_rate = Some(Rational::new(fr.num, fr.den));
+                }
+            } else {
+                if p.avctx.sample_rate > 0 {
+                    params.sample_rate = Some(p.avctx.sample_rate as u32);
+                }
+                if p.avctx.channels > 0 {
+                    params.channels = Some(p.avctx.channels as u16);
+                }
+            }
+        }
+    }
+
+    /// read_frame_internal's step: one PES through its stream's stage, or
+    /// at the end of input every parser flushed.
+    fn read_pes(&mut self) -> CoreResult<()> {
+        match self.inner.next_pes() {
+            Ok((pkt, info)) => {
+                let index = pkt.stream_index as usize;
+                match self.stages.get_mut(index) {
+                    Some(Stage::Raw { intra_only, .. }) => {
+                        let key = *intra_only || pkt.flags.keyframe;
+                        self.queue.push_back(Pending {
+                            stream: pkt.stream_index,
+                            pts: pkt.pts.unwrap_or(NOPTS),
+                            dts: pkt.dts.unwrap_or(NOPTS),
+                            duration: pkt.duration.unwrap_or(0),
+                            key,
+                            container_key: info.random_access,
+                            data: pkt.data,
+                        });
+                    }
+                    Some(Stage::Parsed(p)) => {
+                        let probing = self.probing;
+                        parse_packet(
+                            p,
+                            &mut self.queue,
+                            pkt.stream_index,
+                            &pkt,
+                            info,
+                            false,
+                            probing,
+                        );
+                    }
+                    None => {}
+                }
+                Ok(())
+            }
+            Err(CoreError::Eof) => {
+                let probing = self.probing;
+                for (index, stage) in self.stages.iter_mut().enumerate() {
+                    if let Stage::Parsed(p) = stage {
+                        let flush = Packet::new(index as u32, TimeBase::new(1, 90_000), Vec::new());
+                        parse_packet(
+                            p,
+                            &mut self.queue,
+                            index as u32,
+                            &flush,
+                            PesInfo::default(),
+                            true,
+                            probing,
+                        );
+                    }
+                }
+                self.eof = true;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn to_packet(e: Pending) -> Packet {
+        let ts = |t: i64| {
+            (t != NOPTS).then(|| {
+                if is_relative(t) {
+                    t.wrapping_sub(RELATIVE_TS_BASE)
+                } else {
+                    t
+                }
+            })
+        };
+        let mut pkt = Packet::new(e.stream, TimeBase::new(1, 90_000), e.data).with_keyframe(e.key);
+        pkt.pts = ts(e.pts);
+        pkt.dts = ts(e.dts);
+        pkt.duration = (e.duration != 0).then_some(e.duration);
+        pkt
+    }
+}
+
+impl ParsedStream {
+    /// find_stream_info's per-stream "still needs to be handled" checks.
+    fn analyzed(&self) -> bool {
+        let video = self.avctx.codec.is_video();
+        let parameters = if video {
+            self.avctx.width > 0 && self.avctx.height > 0 && self.parser.state.format.is_some()
+        } else {
+            // A decoded frame tells the sample format and frame size.
+            self.avctx.sample_rate > 0 && self.avctx.channels > 0 && self.nb_frames > 0
+        };
+        // extract_extradata: H.264 waits for SPS and PPS, MPEG video for a
+        // sequence header.
+        let extradata = match self.avctx.codec {
+            Codec::H264 => self.parser.h264_reorder().is_some(),
+            Codec::Mpeg1Video | Codec::Mpeg2Video => self.avctx.width > 0,
+            _ => true,
+        };
+        let fps = !video || self.nb_frames.saturating_sub(1) >= FPS_ANALYZE_FRAMES;
+        let timestamps = self.timing.first_dts != NOPTS || self.nb_frames >= MAX_TS_PROBE;
+        parameters && extradata && fps && timestamps
+    }
+
+    /// The bookkeeping find_stream_info does on a unit it returns: false
+    /// when the analyze duration is reached (the read-ahead ends there).
+    fn returned(&mut self, dts: i64, duration: i64, analyzed_all: bool) -> bool {
+        if dts != NOPTS && self.nb_frames > 1 {
+            if self.fps_first_dts == NOPTS {
+                self.fps_first_dts = dts;
+            }
+            self.fps_last_dts = dts;
+        }
+        if self.nb_frames > 1 {
+            let mut t = rescale(self.info_duration, 1_000_000, 90_000);
+            if t == 0
+                && self.nb_frames > 30
+                && self.fps_first_dts != NOPTS
+                && self.fps_last_dts != NOPTS
+            {
+                t = rescale(
+                    self.fps_last_dts.saturating_sub(self.fps_first_dts),
+                    1_000_000,
+                    90_000,
+                );
+            }
+            let limit = if analyzed_all {
+                ANALYZE_ALL_US
+            } else {
+                ANALYZE_STREAM_US
+            };
+            if t >= limit {
+                return false;
+            }
+            if duration > 0 {
+                self.info_duration = self.info_duration.saturating_add(duration);
+            }
+        }
+        // try_decode_frame: the decoder's reorder depth and AAC frame
+        // size reach the codec context.
+        if let Some((true, reorder)) = self.parser.h264_reorder() {
+            self.avctx.has_b_frames = self.avctx.has_b_frames.max(reorder);
+        }
+        if let Some(adts) = self.parser.last_adts() {
+            self.avctx.frame_size = adts.samples;
+            self.avctx.sample_rate = adts.sample_rate;
+            self.avctx.channels = adts.channels;
+        }
+        self.nb_frames += 1;
+        true
+    }
+
+    /// has_decode_delay_been_guessed while find_stream_info decodes.
+    fn decode_delay_guessed(&self) -> bool {
+        if self.avctx.codec != Codec::H264 {
+            return true;
+        }
+        let has_b_frames = self.avctx.has_b_frames;
+        if has_b_frames != 0
+            && self.parser.h264_reorder().map(|(_, reorder)| reorder) == Some(has_b_frames)
+        {
+            return true;
+        }
+        let decoded = self.nb_frames.saturating_sub(has_b_frames.max(0) as u64);
+        match has_b_frames {
+            ..=2 => decoded >= 7,
+            3 => decoded >= 18,
+            _ => decoded >= 20,
+        }
+    }
+}
+
+/// parse_packet: one demuxed PES (or, with `flush`, the end of input)
+/// through the parser; each unit timed by compute_pkt_fields and queued.
+fn parse_packet(
+    p: &mut ParsedStream,
+    queue: &mut VecDeque<Pending>,
+    stream: u32,
+    pkt: &Packet,
+    info: PesInfo,
+    flush: bool,
+    probing: bool,
+) {
+    let mut rest: &[u8] = &pkt.data;
+    let (mut pts, mut dts) = (pkt.pts.unwrap_or(NOPTS), pkt.dts.unwrap_or(NOPTS));
+    let mut pos = info.pos as i64;
+    let mut rai = info.random_access;
+    let mut got_output = flush;
+    let mut calls = 0usize;
+    while (!rest.is_empty() || (flush && got_output)) && calls < MAX_CALLS_PER_PES {
+        calls += 1;
+        let (next_pts, next_dts) = (pts, dts);
+        let (len, unit) = p.parser.parse2(&mut p.avctx, rest, pts, dts, pos, rai);
+        pts = NOPTS;
+        dts = NOPTS;
+        pos = -1;
+        rai = false;
+        rest = &rest[len.min(rest.len())..];
+        got_output = unit.is_some();
+        let Some(data) = unit else {
+            if len == 0 {
+                break;
+            }
+            continue;
+        };
+        let s = &p.parser.state;
+        let mut e = Pending {
+            stream,
+            pts: s.pts,
+            dts: s.dts,
+            duration: 0,
+            key: s.key_frame == 1 || (s.key_frame == -1 && s.pict_type == pict::I),
+            container_key: s.rai,
+            data,
+        };
+        if !p.avctx.codec.is_video() && p.avctx.sample_rate > 0 && s.duration > 0 {
+            e.duration = rescale_rnd(
+                i64::from(s.duration),
+                90_000,
+                i64::from(p.avctx.sample_rate),
+                Rnd::Down,
+            );
+        }
+        // Outside find_stream_info sti->info is gone: guessed.
+        let guessed = !probing || p.decode_delay_guessed();
+        p.timing.compute_pkt_fields(
+            &mut p.avctx,
+            &p.parser.state,
+            &mut e,
+            next_dts,
+            next_pts,
+            queue,
+            guessed,
+        );
+        queue.push_back(e);
+    }
+}
+
+impl Demuxer for ParsedDemuxer {
+    fn format_name(&self) -> &str {
+        "mpegts"
+    }
+
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+
+    fn next_packet(&mut self) -> CoreResult<Packet> {
+        self.meta = PacketMetadata::default();
+        loop {
+            if let Some(e) = self.queue.pop_front() {
+                self.meta.container_keyframe = e.container_key;
+                return Ok(Self::to_packet(e));
+            }
+            if let Some(e) = self.deferred.take() {
+                return Err(e);
+            }
+            if self.eof {
+                return Err(CoreError::Eof);
+            }
+            self.read_pes()?;
+        }
+    }
+
+    fn packet_metadata(&self) -> PacketMetadata {
+        self.meta.clone()
+    }
+
+    /// The inner demuxer's keyframe-accurate seek, then FFmpeg's flush:
+    /// queued packets dropped, parsers restarted, timing continued from
+    /// the landing.
+    fn seek_to(&mut self, stream_index: u32, pts: i64) -> CoreResult<i64> {
+        self.meta = PacketMetadata::default();
+        let landed = self.inner.seek_to(stream_index, pts)?;
+        self.queue.clear();
+        self.deferred = None;
+        self.eof = false;
+        for stage in &mut self.stages {
+            if let Stage::Parsed(p) = stage {
+                p.parser = Parser::new(p.avctx.codec);
+                p.timing.seeked(landed);
+            }
+        }
+        Ok(landed)
+    }
+
+    fn duration_micros(&self) -> Option<i64> {
+        self.inner.duration_micros()
+    }
+}

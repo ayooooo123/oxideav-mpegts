@@ -11,6 +11,23 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- The registry's `mpegts` demuxer (`open`) is now `ParsedDemuxer`: every
+  PES goes through FFmpeg 2da55bf's parser stage, ported under LGPL-2.1-or-
+  later in `src/ff/` and `src/parsed.rs`. H.264, MPEG-1/2 video, MPEG
+  audio, ADTS AAC, AC-3 and E-AC-3 come out as the packets `av_read_frame`
+  returns — one access unit or audio frame each, with FFmpeg's PTS, DTS,
+  duration, key flag and cross-stream order; other codecs keep one packet
+  per PES. Opening runs `avformat_find_stream_info`'s read-ahead and fills
+  width, height, pixel format, frame rate, sample rate, channels and the
+  MPEG audio layer into `StreamInfo`; on a seekable input demuxing then
+  starts over at the first byte, as `estimate_timings_from_pts` does.
+  `MpegTsDemuxer` keeps returning one packet per PES.
+- `Demuxer::packet_metadata().container_keyframe` reports the
+  random_access_indicator of the PES a packet started in.
+- AC-3 / E-AC-3 in private PES (`stream_type` 0x06) are identified by the
+  DVB AC-3 (0x6A) and enhanced AC-3 (0x7A) descriptors or the `AC-3` /
+  `EAC3` registrations, and ATSC `stream_type` 0x87 is E-AC-3 (FFmpeg's
+  DESC_types, REGD_types and MISC_types).
 - Recognize DVB subtitles in private PES (`stream_type` 0x06) only when
   PMT descriptor 0x59 identifies a subtitle service. Expose `dvb_subtitle`,
   service languages and five-byte composition-page / ancillary-page /
@@ -26,8 +43,29 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   of payload are dropped as before and the rest renumbered; every PES
   read during the probe is delivered by `next_packet` in order.
 
+### Changed
+
+- License: `MIT AND LGPL-2.1-or-later` (the FFmpeg port; see README).
+- A PES that states its length is returned once its last byte arrives,
+  as FFmpeg's `mpegts_push_data` emits it, not at the PID's next unit
+  start.
+- A PES with only a PTS gets DTS = PTS, as FFmpeg sets it.
+- MPEG-1 video streams (`stream_type` 0x01) start as MPEG-2 in the
+  parser and are named `mpeg1video` from a sequence header without an
+  extension, as FFmpeg's ISO_types does.
+- A PID the PMT lists twice keeps one stream; a later entry that names a
+  codec replaces the earlier one (FATE's `ac3/mp3ac325-4864-small.ts`).
+
 ### Fixed
 
+- A partial packet at the end of the input (FATE's
+  `h264/h264_intra_first-small.ts` ends 40 bytes into one) ends the
+  stream instead of failing it with "short read at packet boundary",
+  as FFmpeg's `read_packet` turns a short read into `AVERROR_EOF`; so
+  does running out of input while resyncing.
+- PES that start before the first PAT/PMT are delivered: once the PMT
+  is read, demuxing starts over at the first byte, as FFmpeg's
+  `mpegts_read_header` seeks back after probing.
 - Respect nonzero PES lengths when extracting payloads so TS stuffing
   does not reach decoders. Preserve all DVB PES framing and segment bytes
   across TS packet boundaries, including the last PES flushed at EOF.

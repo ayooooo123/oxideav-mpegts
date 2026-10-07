@@ -107,7 +107,20 @@
 //! The crate ships **no decoders** — every payload byte stays as a
 //! `&[u8]` slice. A downstream pipeline (e.g. `oxideav-cli`'s
 //! `remux bluray:// …` path) iterates packets, drives a reassembler
-//! per PID, and hands the resulting PES payloads to a muxer.
+//! per PID, and hands the resulting PES payloads to a muxer
+//! ([`demuxer::MpegTsDemuxer`] returns one packet per PES).
+//!
+//! The `"mpegts"` container registration instead returns
+//! [`parsed::ParsedDemuxer`]: packets as FFmpeg's demuxer returns them,
+//! one per access unit, through ports of FFmpeg's H.264, MPEG-1/2 video,
+//! MPEG audio, AC-3 and ADTS AAC parsers.
+//!
+//! ## License
+//!
+//! The upstream code is MIT. The parser stage (`ff`, [`parsed`]) is
+//! ported from FFmpeg and is LGPL-2.1-or-later (see `LICENSE-LGPL` and
+//! each file's notice); the crate as a whole is
+//! `MIT AND LGPL-2.1-or-later`.
 //!
 //! ## What's NOT in scope
 //!
@@ -133,7 +146,7 @@
 //!   see the CA system / PID / scrambling mode, but the crate performs
 //!   no CA / CSA decryption.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
 pub mod atsc;
@@ -161,6 +174,10 @@ pub mod demuxer;
 pub mod muxer;
 #[cfg(feature = "registry")]
 pub mod registry;
+#[cfg(feature = "registry")]
+pub(crate) mod ff;
+#[cfg(feature = "registry")]
+pub mod parsed;
 
 pub use build::{
     aac_descriptor, ac3_descriptor, bouquet_name_descriptor, build_eit_pf, build_nit, build_pat,
@@ -236,6 +253,9 @@ pub use demuxer::{
 
 #[cfg(feature = "registry")]
 pub use muxer::{open as open_muxer, MpegTsMuxer, SeamlessSpliceSpec, SpliceSpec};
+
+#[cfg(feature = "registry")]
+pub use parsed::ParsedDemuxer;
 
 #[cfg(feature = "registry")]
 pub use registry::{register, register_containers};
