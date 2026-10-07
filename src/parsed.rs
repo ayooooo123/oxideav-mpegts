@@ -96,6 +96,9 @@ struct ParsedStream {
     rfps: Option<Rfps>,
     /// The H.264 decoder's POC history, while reading ahead.
     output_order: OutputOrder,
+    /// has_codec_parameters as it stood before the unit being returned:
+    /// try_decode_frame checks it before it decodes the unit.
+    had_parameters: bool,
 }
 
 /// H264_MAX_DPB_FRAMES.
@@ -313,6 +316,7 @@ impl ParsedDemuxer {
                         fps_last_dts: NOPTS,
                         rfps: codec.is_video().then(Rfps::new),
                         output_order: OutputOrder::new(),
+                        had_parameters: false,
                     })),
                     // ff_is_intra_only: data and subtitle codecs, and the
                     // audio codecs with AV_CODEC_PROP_INTRA_ONLY.
@@ -409,6 +413,14 @@ impl ParsedDemuxer {
                 }
                 if let Some(fmt) = p.parser.state.format.and_then(pixel_format) {
                     params.pixel_format = Some(fmt);
+                }
+                // codecpar->video_delay: the probing decoder's has_b_frames,
+                // which FFmpeg's H.264 decoder starts from. The H.264
+                // decoder reads it as the `video_delay` codec option.
+                if p.avctx.codec == Codec::H264 {
+                    params
+                        .options
+                        .insert("video_delay", p.avctx.has_b_frames.to_string());
                 }
                 // The codec's rate, else the one estimated from the DTS
                 // (ffprobe's r_frame_rate), not the 1/time_base default.
@@ -582,12 +594,12 @@ impl ParsedStream {
         if let Some(rfps) = &mut self.rfps {
             rfps.add_frame(dts);
         }
-        // try_decode_frame, while it still decodes (has_codec_parameters
-        // and has_decode_delay_been_guessed stop it): the reorder depth
-        // FFmpeg's H.264 decoder finds reaches the codec context, and the
-        // AAC rate, channels and frame size. The AAC decoder has
-        // AV_CODEC_CAP_CHANNEL_CONF, so its first frame is always decoded.
-        let decoding = !(self.has_codec_parameters() && self.decode_delay_guessed());
+        // try_decode_frame, while it still decodes: has_codec_parameters
+        // (as it stood before this unit) and has_decode_delay_been_guessed
+        // stop it, so the first unit is always decoded. The reorder depth
+        // FFmpeg's H.264 and HEVC decoders find reaches the codec context,
+        // and the AAC rate, channels and frame size.
+        let decoding = !(self.had_parameters && self.decode_delay_guessed());
         if decoding {
             if let Some((restriction, reorder)) = self.parser.h264_reorder() {
                 if restriction {
@@ -602,8 +614,6 @@ impl ParsedStream {
             if let Some(reorder) = self.parser.hevc_reorder() {
                 self.avctx.has_b_frames = reorder;
             }
-        }
-        if decoding || self.nb_frames == 0 {
             if let Some(adts) = self.parser.last_adts() {
                 self.avctx.frame_size = adts.samples;
                 self.avctx.sample_rate = adts.sample_rate;
@@ -620,6 +630,7 @@ impl ParsedStream {
             }
         }
         self.nb_frames += 1;
+        self.had_parameters = self.has_codec_parameters();
         true
     }
 

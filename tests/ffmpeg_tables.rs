@@ -57,6 +57,8 @@
 //!   -preset ultrafast -x265-params bframes=2:keyint=8 -pix_fmt yuv420p -f
 //!   mpegts`. `hevc_no_timing.ts`: such a stream that states no timing in
 //!   its VPS or VUI, so FFmpeg times it with the rate it estimates.
+//! - `h264_no_b.ts`: `-f lavfi -i testsrc=size=64x48:rate=25 -t 0.4 -c:v
+//!   libx264 -preset veryfast -bf 0 -g 8 -pix_fmt yuv420p -f mpegts`.
 
 mod common;
 
@@ -195,6 +197,31 @@ fn latm_units_are_split_and_timed_as_ffmpeg_splits_them() {
 fn hevc_access_units_are_split_and_timed_as_ffmpeg_splits_them() {
     assert_fixture("hevc.ts", &[Want::video("hevc", 64, 48)]);
     assert_fixture("hevc_no_timing.ts", &[Want::video("hevc", 64, 48)]);
+}
+
+#[test]
+fn h264_streams_carry_the_reorder_depth_ffmpeg_probed() {
+    // FFmpeg's codecpar->video_delay (ffprobe's has_b_frames) is the
+    // probing decoder's has_b_frames; its H.264 decoder starts from it.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for (file, video_delay) in [
+        ("ffmpeg_mux.ts", "2"),
+        ("h264_late_sps.ts", "2"),
+        ("h264_no_vui_timing.ts", "2"),
+        ("h264_pyramid_no_restriction.ts", "2"),
+        ("lcevc_dual_track.ts", "2"),
+        ("h264_no_b.ts", "0"),
+    ] {
+        let demuxer = open(std::fs::read(dir.join(file)).expect("fixture"));
+        let stream = &demuxer.streams()[0];
+        assert_eq!(stream.params.codec_id.as_str(), "h264", "{file}");
+        assert_eq!(
+            stream.params.options.get("video_delay"),
+            Some(video_delay),
+            "{file}"
+        );
+    }
+    assert_fixture("h264_no_b.ts", &[Want::video("h264", 64, 48)]);
 }
 
 #[test]
