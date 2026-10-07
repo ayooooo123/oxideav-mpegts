@@ -815,11 +815,18 @@ fn decode_timestamp(b: &[u8]) -> Result<u64, TsError> {
     Ok(ts)
 }
 
+/// The most a PES packet without a length (`PES_packet_length` 0, allowed
+/// only for video, §2.4.3.7) may accumulate before the next one starts:
+/// 32 MiB. A longer PES is dropped with an error instead of held.
+pub const MAX_UNBOUNDED_PES_BYTES: usize = 32 << 20;
+
 /// Per-PID PES reassembler.
 ///
 /// Tracks one in-flight PES packet's accumulated payload bytes; emits
 /// a parsed [`PesPacket`] when the next PUSI=1 TS packet arrives or
-/// the caller flushes.
+/// the caller flushes. It keeps no bytes past a PES's declared
+/// `PES_packet_length` (the rest of its TS payloads is stuffing), and at
+/// most [`MAX_UNBOUNDED_PES_BYTES`] of a PES that declares none.
 #[derive(Debug, Default)]
 pub struct PesReassembler {
     /// Accumulated PES packet bytes (starts at packet_start_code_prefix).
@@ -852,6 +859,11 @@ impl PesReassembler {
     /// marks the next PES packet to start on the PID, so a flag on the
     /// starting packet — or on any same-PID packet since the previous
     /// start — tags the PES that begins at the next PUSI.
+    ///
+    /// A PES without a length that would grow past
+    /// [`MAX_UNBOUNDED_PES_BYTES`] is dropped with
+    /// [`TsError::Unsupported`]; its remaining packets are ignored until
+    /// the next PUSI=1.
     pub fn feed(&mut self, ts: &TsPacket<'_>) -> Result<Option<PesPacket>, TsError> {
         let rai = ts
             .adaptation_field
@@ -868,12 +880,12 @@ impl PesReassembler {
                 None
             };
             self.buf.clear();
-            self.buf.extend_from_slice(ts.payload);
             self.started = true;
             // The PES starting here is announced by an indicator on
             // this very packet or one seen since the previous start.
             self.current_rai = self.pending_rai || rai;
             self.pending_rai = false;
+            self.append(ts.payload)?;
             Ok(finished)
         } else {
             if rai {
@@ -881,12 +893,44 @@ impl PesReassembler {
                 self.pending_rai = true;
             }
             if self.started {
-                self.buf.extend_from_slice(ts.payload);
+                self.append(ts.payload)?;
             }
             // Continuation bytes before we've seen the first PUSI=1
             // are discarded — per spec we can't anchor the packet yet.
             Ok(None)
         }
+    }
+
+    /// Keep `payload` as far as the in-flight PES extends: through its
+    /// declared `PES_packet_length`, or, when it declares none (0), up to
+    /// [`MAX_UNBOUNDED_PES_BYTES`], checked before the bytes are kept.
+    fn append(&mut self, mut payload: &[u8]) -> Result<(), TsError> {
+        if self.buf.len() < 6 {
+            // The length field is not in yet.
+            let take = payload.len().min(6 - self.buf.len());
+            self.buf.extend_from_slice(&payload[..take]);
+            payload = &payload[take..];
+            if self.buf.len() < 6 {
+                return Ok(());
+            }
+        }
+        let declared = usize::from(u16::from_be_bytes([self.buf[4], self.buf[5]]));
+        if declared != 0 {
+            let left = (6 + declared).saturating_sub(self.buf.len());
+            self.buf
+                .extend_from_slice(&payload[..payload.len().min(left)]);
+            return Ok(());
+        }
+        if self.buf.len() + payload.len() > MAX_UNBOUNDED_PES_BYTES {
+            self.buf = Vec::new();
+            self.started = false;
+            self.current_rai = false;
+            return Err(TsError::Unsupported(
+                "PES packet without a length longer than the 32 MiB reassembly bound",
+            ));
+        }
+        self.buf.extend_from_slice(payload);
+        Ok(())
     }
 
     /// Drain the buffered PES packet (call at end-of-stream).
@@ -2081,5 +2125,135 @@ mod tests {
             }
             other => panic!("expected Truncated, got {other:?}"),
         }
+    }
+
+    /// Same-PID TS packets continuing a PES (PUSI = 0), 184 payload bytes
+    /// each, continuity counters counting from 0.
+    fn continuation_packets(pid: u16, count: usize, byte: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(count * TS_PACKET_LEN);
+        for i in 0..count {
+            out.extend_from_slice(&[
+                TS_SYNC_BYTE,
+                ((pid >> 8) & 0x1F) as u8,
+                pid as u8,
+                0x10 | (i as u8 & 0x0F),
+            ]);
+            out.resize(out.len() + 184, byte);
+        }
+        out
+    }
+
+    /// Feed `ts` to `r`; the PES packets it completes, and every error.
+    fn feed_all(r: &mut PesReassembler, ts: &[u8]) -> (Vec<PesPacket>, Vec<TsError>) {
+        let (mut done, mut errors) = (Vec::new(), Vec::new());
+        for pkt in crate::iter_packets(ts) {
+            match r.feed(&pkt.unwrap()) {
+                Ok(Some(pes)) => done.push(pes),
+                Ok(None) => {}
+                Err(e) => errors.push(e),
+            }
+            assert!(
+                r.buf.len() <= MAX_UNBOUNDED_PES_BYTES,
+                "reassembly held {} bytes",
+                r.buf.len()
+            );
+        }
+        (done, errors)
+    }
+
+    #[test]
+    fn bounded_pes_retains_nothing_past_its_declared_extent() {
+        let payload: Vec<u8> = (0..400u32).map(|i| (i & 0xFF) as u8).collect();
+        let pes = build_pes(0xC0, 1000, &payload);
+        let mut ts = pes_into_ts(0x101, &pes, 184);
+        // Continuations past the declared PES_packet_length, then the
+        // next PES's start.
+        ts.extend(continuation_packets(0x101, 10_000, 0xAB));
+        ts.extend(pes_into_ts(0x101, &build_pes(0xC0, 2000, b"next"), 184));
+        let mut r = PesReassembler::new();
+        let mut done = Vec::new();
+        for pkt in crate::iter_packets(&ts) {
+            if let Some(p) = r.feed(&pkt.unwrap()).unwrap() {
+                done.push(p);
+            }
+            assert!(
+                r.buf.len() <= pes.len(),
+                "held {} bytes of a {}-byte PES",
+                r.buf.len(),
+                pes.len()
+            );
+        }
+        done.extend(r.flush().unwrap());
+        assert_eq!(done.len(), 2);
+        assert_eq!(
+            (done[0].pts_90k, &done[0].payload[..]),
+            (Some(1000), &payload[..])
+        );
+        assert_eq!(
+            (done[1].pts_90k, &done[1].payload[..]),
+            (Some(2000), &b"next"[..])
+        );
+    }
+
+    /// The PES header itself split across TS packets: its length is known
+    /// only from its sixth byte on, and the PES still reassembles whole.
+    #[test]
+    fn pes_header_split_across_ts_packets_reassembles() {
+        let payload: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+        let pes = build_pes(0xC0, 4321, &payload);
+        let mut r = PesReassembler::new();
+        let (done, errors) = feed_all(&mut r, &pes_into_ts(0x101, &pes, 3));
+        assert!(done.is_empty() && errors.is_empty());
+        let flushed = r.flush().unwrap().unwrap();
+        assert_eq!(
+            (flushed.pts_90k, &flushed.payload[..]),
+            (Some(4321), &payload[..])
+        );
+    }
+
+    /// A video PES with PES_packet_length 0 (unbounded) as `total` bytes
+    /// of PES.
+    fn unbounded_pes(total: usize) -> Vec<u8> {
+        let mut pes = build_pes(0xE0, 90_000, &[]);
+        pes[4] = 0;
+        pes[5] = 0;
+        let header = pes.len();
+        pes.extend((0..total - header).map(|i| (i % 253) as u8));
+        pes
+    }
+
+    #[test]
+    fn unbounded_pes_reassembles_up_to_the_bound() {
+        let pes = unbounded_pes(MAX_UNBOUNDED_PES_BYTES);
+        let mut r = PesReassembler::new();
+        let (done, errors) = feed_all(&mut r, &pes_into_ts(0x100, &pes, 184));
+        assert!(done.is_empty() && errors.is_empty(), "{errors:?}");
+        let flushed = r.flush().unwrap().unwrap();
+        assert_eq!(flushed.payload.len(), MAX_UNBOUNDED_PES_BYTES - 14);
+        assert!(flushed.payload[..] == pes[14..]);
+    }
+
+    /// One byte past the bound is an error before the bytes are kept: the
+    /// PES is dropped, the rest of it ignored, and the next PES
+    /// reassembles.
+    #[test]
+    fn unbounded_pes_past_the_bound_is_dropped_before_it_is_kept() {
+        let mut ts = pes_into_ts(0x100, &unbounded_pes(MAX_UNBOUNDED_PES_BYTES + 1), 184);
+        ts.extend(continuation_packets(0x100, 100, 0xCD));
+        ts.extend(pes_into_ts(0x100, &build_pes(0xE0, 180_000, b"after"), 184));
+        let mut r = PesReassembler::new();
+        let (done, errors) = feed_all(&mut r, &ts);
+        assert!(done.is_empty(), "the oversized PES is not emitted");
+        assert_eq!(errors.len(), 1, "one error: {errors:?}");
+        assert!(
+            matches!(errors[0], TsError::Unsupported(_)),
+            "{:?}",
+            errors[0]
+        );
+        let flushed = r.flush().unwrap().unwrap();
+        assert_eq!(
+            (flushed.pts_90k, &flushed.payload[..]),
+            (Some(180_000), &b"after"[..])
+        );
     }
 }

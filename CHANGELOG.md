@@ -31,6 +31,12 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 - Respect nonzero PES lengths when extracting payloads so TS stuffing
   does not reach decoders. Preserve all DVB PES framing and segment bytes
   across TS packet boundaries, including the last PES flushed at EOF.
+- `PesReassembler` no longer keeps continuation payload past a PES's
+  declared `PES_packet_length` until the next PUSI: memory stays at the
+  PES's own size however many same-PID packets follow. A PES without a
+  length is held up to `pes::MAX_UNBOUNDED_PES_BYTES` (32 MiB), checked
+  before its bytes are kept; a longer one is dropped with
+  `TsError::Unsupported` and the next PES reassembles as before.
 
 ## [0.0.3](https://github.com/OxideAV/oxideav-mpegts/compare/v0.0.2...v0.0.3) - 2026-08-23
 
