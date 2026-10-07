@@ -22,6 +22,24 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
   MPEG audio layer into `StreamInfo`; on a seekable input demuxing then
   starts over at the first byte, as `estimate_timings_from_pts` does.
   `MpegTsDemuxer` keeps returning one packet per PES.
+- More of FFmpeg's parsers in that stage: DTS (core frames, and a core
+  with its DTS-HD extension substream), TrueHD / MLP, AAC in LATM/LOAS,
+  HEVC, Opus in TS (the control header stripped) and LCEVC. They split
+  and time units as FFmpeg does; LATM keeps the `aac` codec id (FFmpeg
+  names it `aac_latm`).
+- Opus in TS opens: the `Opus` registration names it and the DVB
+  extension descriptor 0x7F/0x80 gives FFmpeg's OpusHead extradata,
+  channels and rate. FFmpeg reads the first PMT twice, so this works in
+  either descriptor order; the PMT fold here does the same.
+- Stream types 0x33 (VVC) and 0x36 (LCEVC, an enhancement track of its
+  own) open as video streams; a metadata descriptor (0x26) names timed
+  ID3 and KLV data streams.
+- HDMV TrueHD (stream type 0x83 under an `HDMV`/`HDPR` registration)
+  gets the AC-3 stream FFmpeg adds for the PES with extended_stream_id
+  0x76 on the same PID.
+- A PMT version met while `ParsedDemuxer` reads ahead at open adds
+  streams for the PIDs it lists first; they carry packets from that PMT
+  on, as FFmpeg's do. The stream list stays fixed once open returns.
 - `Demuxer::packet_metadata().container_keyframe` reports the
   random_access_indicator of the PES a packet started in.
 - AC-3 / E-AC-3 in private PES (`stream_type` 0x06) are identified by the

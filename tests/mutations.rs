@@ -1,8 +1,10 @@
-//! Seeded mutations of an FFmpeg-muxed stream (`data/ffmpeg_mux.ts`:
-//! H.264, AC-3, MP2, ADTS AAC, E-AC-3) through the registry demuxer and
-//! its FFmpeg parser stage: every mutant opens or fails cleanly, never
-//! panics, and ends — at most its own bytes come back out, in at most
-//! as many packets, before and after a seek.
+//! Seeded mutations of FFmpeg-muxed streams through the registry demuxer
+//! and its FFmpeg parser stage: every mutant opens or fails cleanly, never
+//! panics, and ends — at most its own bytes come back out, in at most as
+//! many packets, before and after a seek. `data/ffmpeg_mux.ts` carries
+//! H.264, AC-3, MP2, ADTS AAC and E-AC-3; the other fixtures one codec
+//! each of the rest of the stage (DTS, TrueHD, LATM, HEVC, Opus, LCEVC)
+//! and the PMT paths (a PMT version, timed ID3, VVC).
 
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
@@ -69,19 +71,49 @@ fn drain(demuxer: &mut dyn Demuxer, len: usize, mutant: usize) {
 
 #[test]
 fn mutated_streams_end_cleanly() {
+    mutate(TS, 2500, 0x7EA5_5EED_2DA5_5BF0);
+}
+
+#[test]
+fn mutated_streams_of_every_parser_end_cleanly() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let fixtures = [
+        "dts_two_per_pes.ts",
+        "dtshd_ma.ts",
+        "truehd.ts",
+        "truehd_hdmv.m2ts",
+        "aac_latm.ts",
+        "hevc.ts",
+        "hevc_no_timing.ts",
+        "opus_51.ts",
+        "lcevc_dual_track.ts",
+        "vvc.ts",
+        "pmt_change.ts",
+        "timed_id3.ts",
+    ];
+    for (i, name) in fixtures.iter().enumerate() {
+        let ts = std::fs::read(dir.join(name)).expect("fixture");
+        eprintln!("{name}");
+        mutate(&ts, 300, 0x5EED_0000 + i as u64);
+    }
+}
+
+/// `mutants` seeded mutants of `ts`.
+fn mutate(ts: &[u8], mutants: usize, seed: u64) {
     // Packets that start a PES carry its header and the codec headers
     // the parsers read (SPS/PPS/SEI, sync frames): half the edits go
     // there.
-    let heads: Vec<usize> = (0..TS.len() / TS_PACKET_LEN)
+    let heads: Vec<usize> = (0..ts.len() / TS_PACKET_LEN)
         .map(|i| i * TS_PACKET_LEN)
-        .filter(|&at| TS[at + 1] & 0x40 != 0)
+        .filter(|&at| ts[at + 1] & 0x40 != 0)
         .collect();
-    let mut rng = Rng(0x7EA5_5EED_2DA5_5BF0);
+    let mut rng = Rng(seed);
     let mut opened = 0;
-    for mutant in 0..MUTANTS {
-        let mut bytes = TS.to_vec();
+    for mutant in 0..mutants {
+        let mut bytes = ts.to_vec();
         for _ in 0..1 + rng.below(8) {
-            let at = if rng.below(2) == 0 {
+            // A fixture of 192-byte packets may have no 188-aligned head.
+            let at = if rng.below(2) == 0 && !heads.is_empty() {
                 heads[rng.below(heads.len())] + rng.below(64)
             } else {
                 rng.below(bytes.len())
@@ -137,7 +169,7 @@ fn mutated_streams_end_cleanly() {
     }
     // Most mutants keep a usable PAT/PMT: the parser stage really ran.
     assert!(
-        opened > MUTANTS / 2,
-        "only {opened} of {MUTANTS} mutants opened"
+        opened > mutants / 2,
+        "only {opened} of {mutants} mutants opened"
     );
 }
