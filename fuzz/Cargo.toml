@@ -53,6 +53,11 @@ path = ".."
 [workspace]
 members = ["."]
 
+# PacketMetadata and Demuxer::packet_metadata come from the PearTube core
+# fork. This workspace is separate, so the parent's patch does not reach it.
+[patch.crates-io]
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "96094a916d8b9f2695f70bb0d53e5956b8a79847" }
+
 [profile.release]
 debug = 1
 

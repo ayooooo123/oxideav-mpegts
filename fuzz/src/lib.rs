@@ -778,10 +778,12 @@ impl MuxPlan {
                 ));
             }
             for (di, &slot) in prog.stream_slots.iter().enumerate() {
+                // A PES with only a PTS demuxes with DTS = PTS, as
+                // FFmpeg sets it.
                 let want: Vec<(i64, Option<i64>, usize, bool)> = self.streams[slot]
                     .frames
                     .iter()
-                    .map(|f| (f.pts, f.dts, f.len, f.keyframe))
+                    .map(|f| (f.pts, f.dts.or(Some(f.pts)), f.len, f.keyframe))
                     .collect();
                 assert_eq!(
                     got[di], want,

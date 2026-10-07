@@ -89,9 +89,8 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "oxideav-core"
-version = "0.1.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a68d9a74d6d0a7373589eca0c0bb8ab380c46fd1d7fc807e696d716cdad078c"
+version = "0.1.37"
+source = "git+https://github.com/ayooooo123/oxideav-core?rev=96094a916d8b9f2695f70bb0d53e5956b8a79847#96094a916d8b9f2695f70bb0d53e5956b8a79847"
 dependencies = [
  "bytemuck",
  "serde_json",
@@ -100,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "oxideav-mpegts"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "oxideav-core",
  "thiserror",
