@@ -27,10 +27,118 @@
 //!   each SPS without its bitstream restriction and each PES with its PTS
 //!   only: the reorder depth (2) comes from the picture order FFmpeg's
 //!   decoder sees, and decides the DTS FFmpeg gives.
+//! - `opus_51.ts`: 5.1 Opus (libopus) as FFmpeg's muxer writes it: an
+//!   `Opus` registration, then the DVB extension descriptor 0x7F/0x80
+//!   with channel configuration 6. `opus_ext_first.ts`: the same with the
+//!   extension descriptor first, as FATE's `test-8-7.1.opus-small.ts`
+//!   orders them.
+//! - `id3.ts`: FATE's `mpegts/id3.ts` (stream type 0x15, a metadata
+//!   descriptor naming `ID3 `). `timed_id3.ts`: FFmpeg-muxed MP2 (lavfi
+//!   sine) with such a stream added to the PMT and two ID3 PES.
+//! - `vvc.ts`: FATE's `lcevc/L_VVC_640x360p_8bit8bit_2D_dd.ts` (stream
+//!   type 0x33). `lcevc_dual_track.ts`: FATE's
+//!   `lcevc/L_H264_640x360p_8bit8bit_2D_dd_dualTrack.ts` (H.264 and an
+//!   LCEVC enhancement track, stream type 0x36).
+//! - `pmt_change.ts`: an FFmpeg-muxed MP2 file, then one with MP2 and
+//!   AC-3 on a new PID whose PMT is rewritten to version 1.
 
 mod common;
 
 use common::{assert_fixture, assert_table, drain, open, Want};
+
+/// A packet row without its duration and flags: the fields a stream
+/// FFmpeg runs through a parser this crate does not port (VVC, LCEVC)
+/// still matches.
+fn without_parser_fields(row: &str) -> String {
+    let f: Vec<&str> = row.split('|').collect();
+    format!("{}|{}|{}|{}|{}", f[0], f[1], f[2], f[4], f[6])
+}
+
+/// The fixture opens with `want`'s streams; its rows equal ffprobe's,
+/// those of `unparsed` streams without their parser fields.
+fn assert_fixture_unparsed(file: &str, want: &[Want], unparsed: &[&str]) {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let bytes = std::fs::read(dir.join(file)).expect("fixture");
+    let table = std::fs::read_to_string(dir.join(file).with_extension("packets")).expect("table");
+    let mut demuxer = open(bytes);
+    let streams: Vec<(String, oxideav_core::MediaType)> = demuxer
+        .streams()
+        .iter()
+        .map(|s| (s.params.codec_id.as_str().to_owned(), s.params.media_type))
+        .collect();
+    let wanted: Vec<(String, oxideav_core::MediaType)> =
+        want.iter().map(|w| (w.codec.to_owned(), w.kind)).collect();
+    assert_eq!(streams, wanted, "{file}");
+    let strip = |row: &str| {
+        if unparsed.contains(&row.split('|').next().unwrap_or("")) {
+            without_parser_fields(row)
+        } else {
+            row.to_owned()
+        }
+    };
+    let ours: Vec<String> = drain(&mut *demuxer).iter().map(|r| strip(r)).collect();
+    let theirs: String = table.lines().map(|r| strip(r) + "\n").collect();
+    assert_table(&ours, &theirs);
+}
+
+#[test]
+fn opus_opens_with_the_channels_its_extension_descriptor_states() {
+    // FFmpeg reads the first PMT twice (the header scan, then again after
+    // seeking back), so the descriptor applies in either order.
+    for file in ["opus_51.ts", "opus_ext_first.ts"] {
+        assert_fixture(file, &[Want::audio("opus", 48_000, 6)]);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+        let demuxer = open(std::fs::read(dir.join(file)).expect("fixture"));
+        // ffprobe -show_streams -show_data: the OpusHead FFmpeg builds.
+        assert_eq!(
+            demuxer.streams()[0].params.extradata,
+            b"OpusHead\x01\x06\x00\x00\x80\xbb\x00\x00\x00\x00\x01\x04\x02\x00\x04\x01\x02\x03\x05",
+            "{file}"
+        );
+    }
+}
+
+#[test]
+fn timed_id3_opens_as_a_data_stream() {
+    assert_fixture("id3.ts", &[Want::data("timed_id3")]);
+    assert_fixture(
+        "timed_id3.ts",
+        &[Want::audio("mp2", 48_000, 1), Want::data("timed_id3")],
+    );
+}
+
+#[test]
+fn vvc_opens() {
+    assert_fixture_unparsed(
+        "vvc.ts",
+        &[Want::any("vvc", oxideav_core::MediaType::Video)],
+        &["0"],
+    );
+}
+
+#[test]
+fn an_lcevc_enhancement_track_is_its_own_stream() {
+    // FFmpeg's lcevc_parser splits and flags its units; durations come
+    // from the rate estimated from their DTS.
+    assert_fixture_unparsed(
+        "lcevc_dual_track.ts",
+        &[
+            Want::any("h264", oxideav_core::MediaType::Video),
+            Want::any("lcevc", oxideav_core::MediaType::Video),
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn a_pmt_version_that_adds_a_pid_adds_its_stream() {
+    // The new PID's PES count from the PMT that lists it on: FFmpeg's
+    // header scan stops at the first PMT, so no seek back covers it.
+    assert_fixture(
+        "pmt_change.ts",
+        &[Want::audio("mp2", 48_000, 1), Want::audio("ac3", 48_000, 1)],
+    );
+}
 
 #[test]
 fn adts_channel_configuration_seven_is_eight_channels() {

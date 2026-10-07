@@ -182,6 +182,8 @@ fn parsed_codec(codec_id: &str, stream_type: Option<u8>) -> Option<Codec> {
         "aac" if stream_type == Some(0x0F) => Codec::Aac,
         "ac3" => Codec::Ac3,
         "eac3" => Codec::Eac3,
+        "opus" => Codec::Opus,
+        "lcevc" => Codec::Lcevc,
         _ => return None,
     })
 }
@@ -194,7 +196,19 @@ fn pixel_format(fmt: PixFmt) -> Option<PixelFormat> {
         PixFmt::Yuv420p10 => PixelFormat::Yuv420P10Le,
         PixFmt::Yuv422p10 => PixelFormat::Yuv422P10Le,
         PixFmt::Yuv444p10 => PixelFormat::Yuv444P10Le,
-        PixFmt::Yuv420p9 | PixFmt::Yuv422p9 | PixFmt::Yuv444p9 => return None,
+        PixFmt::Yuv420p9
+        | PixFmt::Yuv422p9
+        | PixFmt::Yuv444p9
+        | PixFmt::Yuv420p12
+        | PixFmt::Yuv422p12
+        | PixFmt::Yuv444p12
+        | PixFmt::Yuv420p14
+        | PixFmt::Yuv422p14
+        | PixFmt::Yuv444p14
+        | PixFmt::Gray8
+        | PixFmt::Gray10
+        | PixFmt::Gray12
+        | PixFmt::Gray14 => return None,
     })
 }
 
@@ -227,43 +241,25 @@ impl std::fmt::Debug for ParsedDemuxer {
 impl ParsedDemuxer {
     /// Wrap an opened [`MpegTsDemuxer`]: read ahead for the stream
     /// parameters, then start over at the first byte.
-    pub fn new(inner: MpegTsDemuxer) -> CoreResult<Self> {
-        let streams = inner.streams().to_vec();
-        let stages = streams
-            .iter()
-            .map(
-                |s| match parsed_codec(s.params.codec_id.as_str(), inner.stream_type(s.index)) {
-                    Some(codec) => Stage::Parsed(Box::new(ParsedStream {
-                        parser: Parser::new(codec),
-                        avctx: CodecCtx::new(codec),
-                        timing: StreamTiming::new(),
-                        nb_frames: 0,
-                        info_duration: 0,
-                        fps_first_dts: NOPTS,
-                        fps_last_dts: NOPTS,
-                        rfps: codec.is_video().then(Rfps::new),
-                        output_order: OutputOrder::new(),
-                    })),
-                    None => Stage::Raw {
-                        intra_only: s.params.media_type == MediaType::Subtitle
-                            || s.params.codec_id.as_str() == "dts"
-                            || s.params.codec_id.as_str().starts_with("pcm_"),
-                        seen: false,
-                    },
-                },
-            )
-            .collect();
+    pub fn new(mut inner: MpegTsDemuxer) -> CoreResult<Self> {
+        // A PMT version met while reading ahead may add streams, as it
+        // adds them to FFmpeg's find_stream_info; after that the list
+        // stays as it is.
+        inner.grow_streams(true);
         let mut d = Self {
             inner,
-            streams,
-            stages,
+            streams: Vec::new(),
+            stages: Vec::new(),
             queue: VecDeque::new(),
             meta: PacketMetadata::default(),
             eof: false,
             probing: true,
             deferred: None,
         };
+        d.adopt_streams();
         d.find_stream_info();
+        d.inner.grow_streams(false);
+        d.adopt_streams();
         // ff_rfps_calculate and the r_frame_rate find_stream_info leaves.
         for stage in &mut d.stages {
             if let Stage::Parsed(p) = stage {
@@ -289,6 +285,44 @@ impl ParsedDemuxer {
             }
         }
         Ok(d)
+    }
+
+    /// Take on the streams the demuxer has that this one has not yet,
+    /// each with its parser stage.
+    fn adopt_streams(&mut self) {
+        for s in &self.inner.streams()[self.streams.len()..] {
+            let stage =
+                match parsed_codec(s.params.codec_id.as_str(), self.inner.stream_type(s.index)) {
+                    Some(codec) => Stage::Parsed(Box::new(ParsedStream {
+                        parser: Parser::new(codec),
+                        // The container's extradata (an OpusHead the PMT
+                        // stated) is the codec context's.
+                        avctx: CodecCtx {
+                            extradata: s.params.extradata.clone(),
+                            ..CodecCtx::new(codec)
+                        },
+                        timing: StreamTiming::new(),
+                        nb_frames: 0,
+                        info_duration: 0,
+                        fps_first_dts: NOPTS,
+                        fps_last_dts: NOPTS,
+                        rfps: codec.is_video().then(Rfps::new),
+                        output_order: OutputOrder::new(),
+                    })),
+                    // ff_is_intra_only: data and subtitle codecs, and the
+                    // audio codecs with AV_CODEC_PROP_INTRA_ONLY.
+                    None => Stage::Raw {
+                        intra_only: matches!(
+                            s.params.media_type,
+                            MediaType::Subtitle | MediaType::Data
+                        ) || s.params.codec_id.as_str() == "dts"
+                            || s.params.codec_id.as_str().starts_with("pcm_"),
+                        seen: false,
+                    },
+                };
+            self.stages.push(stage);
+            self.streams.push(s.clone());
+        }
     }
 
     /// The read-ahead, until the probe size, the analyze duration, the
@@ -400,6 +434,9 @@ impl ParsedDemuxer {
             Ok(None) => Ok(false),
             Ok(Some((pkt, info))) => {
                 let index = pkt.stream_index as usize;
+                if index >= self.stages.len() {
+                    self.adopt_streams();
+                }
                 match self.stages.get_mut(index) {
                     Some(Stage::Raw { intra_only, .. }) => {
                         let key = *intra_only || pkt.flags.keyframe;

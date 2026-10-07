@@ -8,14 +8,17 @@
 // of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See LICENSE-LGPL.
 
 //! FFmpeg's parser stage for the codecs FFmpeg's MPEG-TS demuxer parses:
-//! the codec parsers (`h264`, `mpegvideo`, `mpegaudio`, `aac_ac3`), the
-//! generic parser bookkeeping (`parser`) and the demuxer-side packet timing
-//! (`timing`). [`crate::parsed::ParsedDemuxer`] drives them.
+//! the codec parsers (`h264`, `mpegvideo`, `mpegaudio`, `aac_ac3`,
+//! `opus`, `lcevc`), the generic parser bookkeeping (`parser`) and the
+//! demuxer-side packet timing (`timing`). [`crate::parsed::ParsedDemuxer`]
+//! drives them.
 
 pub(crate) mod aac_ac3;
 pub(crate) mod bits;
 pub(crate) mod h264;
+pub(crate) mod lcevc;
 pub(crate) mod mpegaudio;
 pub(crate) mod mpegvideo;
+pub(crate) mod opus;
 pub(crate) mod parser;
 pub(crate) mod timing;

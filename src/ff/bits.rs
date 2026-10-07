@@ -94,7 +94,6 @@ impl<'a> BitReader<'a> {
     }
 
     /// `get_bits_count`.
-    #[cfg(test)]
     pub fn count(&self) -> u64 {
         self.index
     }

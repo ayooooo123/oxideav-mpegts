@@ -14,7 +14,7 @@
 // It is distributed WITHOUT ANY WARRANTY; without even the implied warranty
 // of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See LICENSE-LGPL.
 
-use super::{aac_ac3, h264, mpegaudio, mpegvideo};
+use super::{aac_ac3, h264, lcevc, mpegaudio, mpegvideo, opus};
 
 /// AV_NOPTS_VALUE.
 pub(crate) const NOPTS: i64 = i64::MIN;
@@ -59,6 +59,8 @@ pub(crate) enum Codec {
     Aac,
     Ac3,
     Eac3,
+    Opus,
+    Lcevc,
 }
 
 impl Codec {
@@ -73,16 +75,21 @@ impl Codec {
             Codec::Aac => "aac",
             Codec::Ac3 => "ac3",
             Codec::Eac3 => "eac3",
+            Codec::Opus => "opus",
+            Codec::Lcevc => "lcevc",
         }
     }
 
     pub fn is_video(self) -> bool {
-        matches!(self, Codec::H264 | Codec::Mpeg1Video | Codec::Mpeg2Video)
+        matches!(
+            self,
+            Codec::H264 | Codec::Mpeg1Video | Codec::Mpeg2Video | Codec::Lcevc
+        )
     }
 
     /// AV_CODEC_PROP_FIELDS (codec_desc.c).
     pub fn fields(self) -> bool {
-        self.is_video()
+        matches!(self, Codec::H264 | Codec::Mpeg1Video | Codec::Mpeg2Video)
     }
 
     /// ff_is_intra_only: AV_CODEC_PROP_INTRA_ONLY audio (AAC has no such
@@ -90,7 +97,7 @@ impl Codec {
     pub fn intra_only(self) -> bool {
         matches!(
             self,
-            Codec::Mp1 | Codec::Mp2 | Codec::Mp3 | Codec::Ac3 | Codec::Eac3
+            Codec::Mp1 | Codec::Mp2 | Codec::Mp3 | Codec::Ac3 | Codec::Eac3 | Codec::Opus
         )
     }
 }
@@ -431,6 +438,16 @@ pub(crate) enum PixFmt {
     Yuv420p10,
     Yuv422p10,
     Yuv444p10,
+    Yuv420p12,
+    Yuv422p12,
+    Yuv444p12,
+    Yuv420p14,
+    Yuv422p14,
+    Yuv444p14,
+    Gray8,
+    Gray10,
+    Gray12,
+    Gray14,
 }
 
 impl ParserState {
@@ -507,6 +524,8 @@ enum Kind {
     MpegVideo(mpegvideo::MpegVideoParser),
     MpegAudio(mpegaudio::MpegAudioParser),
     AacAc3(aac_ac3::AacAc3Parser),
+    Opus(opus::OpusParser),
+    Lcevc(lcevc::LcevcParser),
 }
 
 /// An FFmpeg parser: codec state plus AVCodecParserContext.
@@ -530,6 +549,8 @@ impl Parser {
             }
             Codec::Aac => (Kind::AacAc3(aac_ac3::AacAc3Parser::aac()), pict::I),
             Codec::Ac3 | Codec::Eac3 => (Kind::AacAc3(aac_ac3::AacAc3Parser::ac3()), pict::I),
+            Codec::Opus => (Kind::Opus(opus::OpusParser::new()), pict::I),
+            Codec::Lcevc => (Kind::Lcevc(lcevc::LcevcParser::new()), pict::I),
         };
         Self {
             state: ParserState::new(pict_type),
@@ -579,6 +600,8 @@ impl Parser {
             Kind::MpegVideo(p) => p.parse(&mut self.state, avctx, buf)?,
             Kind::MpegAudio(p) => p.parse(&mut self.state, avctx, buf)?,
             Kind::AacAc3(p) => p.parse(&mut self.state, avctx, buf)?,
+            Kind::Opus(p) => p.parse(&mut self.state, avctx, buf)?,
+            Kind::Lcevc(p) => p.parse(&mut self.state, avctx, buf)?,
         };
         let s = &mut self.state;
         if avctx.codec.is_video() {

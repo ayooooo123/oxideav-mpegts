@@ -835,7 +835,7 @@ fn first_zero(buf: &[u8]) -> usize {
 
 /// The parser's find_start_code: the index of the next NAL header byte
 /// at or after `from`, or `buf.len()`.
-fn find_nal_start(buf: &[u8], from: usize) -> usize {
+pub(crate) fn find_nal_start(buf: &[u8], from: usize) -> usize {
     let mut state = u32::MAX;
     let after = find_start_code(buf, from, buf.len() + 1, &mut state);
     (after - 1).min(buf.len())
@@ -843,7 +843,7 @@ fn find_nal_start(buf: &[u8], from: usize) -> usize {
 
 /// ff_h2645_extract_rbsp (small padding): the bytes consumed and the NAL
 /// with emulation prevention removed, ending at the next start code.
-fn extract_rbsp(src: &[u8]) -> (usize, Cow<'_, [u8]>) {
+pub(crate) fn extract_rbsp(src: &[u8]) -> (usize, Cow<'_, [u8]>) {
     let mut length = src.len();
     let mut i = 0usize;
     let mut escaped = false;

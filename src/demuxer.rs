@@ -156,6 +156,25 @@ pub struct MpegTsDemuxer {
     /// Every read strips the framing down to the logical 188-byte
     /// window.
     layout: crate::packet::TsPacketLayout,
+    /// The selected program's PMT PID, watched while demuxing.
+    pmt_pid: u16,
+    pmt_assembler: PsiSectionAssembler,
+    /// `(version_number, CRC)` of the last PMT section applied: FFmpeg's
+    /// skip_identical. Cleared by [`Self::rewind`], as FFmpeg's seek
+    /// resets `last_ver`.
+    last_pmt: Option<(u8, u32)>,
+    /// Whether a PMT version may add streams: only while
+    /// [`crate::parsed::ParsedDemuxer`] reads ahead at open, so
+    /// [`Demuxer::streams`] is stable once open returns.
+    grow_streams: bool,
+    /// PIDs a later PMT version listed while streams could not grow:
+    /// added once they can.
+    noted: Vec<(u16, CodecParameters, u8)>,
+    /// PIDs added by a later PMT version, in the order added.
+    late_pids: Vec<u16>,
+    /// Late PIDs whose PMT this read has not met yet: their PES are not
+    /// delivered (FFmpeg has no PES filter for them until then).
+    inactive: std::collections::HashSet<u16>,
 }
 
 /// Container facts about one reassembled PES.
@@ -396,10 +415,10 @@ impl MpegTsDemuxer {
             let sections = pmt_assembler
                 .feed(pkt.payload, pkt.payload_unit_start, pkt.continuity_counter)
                 .map_err(map_ts_err)?;
-            let mut got: Option<ProgramMapTable> = None;
+            let mut got: Option<(ProgramMapTable, u32)> = None;
             for section in &sections {
                 if let Ok(pmt) = ProgramMapTable::parse(section) {
-                    got = Some(pmt);
+                    got = Some((pmt, section_crc(section)));
                     break;
                 }
             }
@@ -407,6 +426,7 @@ impl MpegTsDemuxer {
                 break pmt;
             }
         };
+        let (pmt, pmt_crc) = pmt;
 
         // Step 3: map PMT streams → CodecParameters → StreamInfo. PIDs
         // whose stream_type we don't have a CodecId for are silently
@@ -421,25 +441,10 @@ impl MpegTsDemuxer {
         let mut pts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
         let mut dts_trackers: HashMap<u16, PtsTracker> = HashMap::new();
         let mut stream_types: HashMap<u16, u8> = HashMap::new();
-        // What pmt_cb makes of each PID: every entry applied, in PMT
-        // order, to what the PID had; the streams then made in the order
-        // their PIDs first appear.
-        let mut order: Vec<u16> = Vec::new();
-        let mut identities: HashMap<u16, (EsCodec, Option<String>)> = HashMap::new();
-        for pmt_stream in &pmt.streams {
-            let pid = pmt_stream.elementary_pid;
-            let prev = identities.get(&pid);
-            let es = pmt_entry_codec(prev.map(|(es, _)| es), pmt_stream);
-            // ISO 639 languages do not overwrite one already set
-            // (AV_DICT_DONT_OVERWRITE, mpegts.c:2280).
-            let language = prev
-                .and_then(|(_, l)| l.clone())
-                .or_else(|| first_iso639_language(pmt_stream));
-            if prev.is_none() {
-                order.push(pid);
-            }
-            identities.insert(pid, (es, language));
-        }
+        // FFmpeg reads the first PMT twice: in mpegts_read_header's scan,
+        // and again after it seeks back (handle_packets resets every
+        // section filter's last_ver), with what the first pass decided.
+        let (order, mut identities) = pmt_identities(&pmt.streams, 2);
         for pid in order {
             let (es, language) = identities.remove(&pid).expect("listed");
             let idx = streams.len() as u32;
@@ -512,6 +517,13 @@ impl MpegTsDemuxer {
             last_pcr: None,
             rap_index: None,
             layout,
+            pmt_pid,
+            pmt_assembler: PsiSectionAssembler::new(),
+            last_pmt: Some((pmt.version_number, pmt_crc)),
+            grow_streams: false,
+            noted: Vec::new(),
+            late_pids: Vec::new(),
+            inactive: std::collections::HashSet::new(),
         };
 
         // Probe the container duration from the PCR span (§2.4.2.2).
@@ -1185,6 +1197,10 @@ impl MpegTsDemuxer {
         self.meta = PacketMetadata::default();
         self.eof_reached = false;
         self.pcr_tracker.reset();
+        // A byte jump voids section continuity; every PID known is live,
+        // as FFmpeg's PES filters stay after a seek.
+        self.pmt_assembler = PsiSectionAssembler::new();
+        self.inactive.clear();
         for r in self.reassemblers.values_mut() {
             *r = PesReassembler::new();
         }
@@ -1334,9 +1350,16 @@ impl MpegTsDemuxer {
         // PCR recovery runs on the PCR_PID regardless of whether that
         // PID also carries an elementary stream we track.
         self.observe_pcr(&pkt, pkt_offset);
+        if pkt.pid == self.pmt_pid {
+            self.observe_pmt(&pkt);
+            return Ok(true);
+        }
         let Some(stream_idx) = self.pid_to_stream.get(&pkt.pid).copied() else {
             return Ok(true);
         };
+        if !self.inactive.is_empty() && self.inactive.contains(&pkt.pid) {
+            return Ok(true);
+        }
         let started = self.pes_start.get(&pkt.pid).copied().unwrap_or(pkt_offset);
         if pkt.payload_unit_start {
             self.pes_start.insert(pkt.pid, pkt_offset);
@@ -1504,12 +1527,103 @@ impl MpegTsDemuxer {
 
     /// Start demuxing over from the first packet with fresh PES and
     /// timestamp state (FFmpeg's estimate_timings_from_pts seek back).
+    /// PIDs a later PMT version added wait for that PMT again.
     pub(crate) fn rewind(&mut self) -> CoreResult<()> {
         self.input
             .seek(std::io::SeekFrom::Start(0))
             .map_err(CoreError::Io)?;
         self.reposition(0, None);
+        self.last_pmt = None;
+        self.inactive = self.late_pids.iter().copied().collect();
         Ok(())
+    }
+
+    /// Let PMT versions add streams (`true`, the open read-ahead) or not.
+    /// Turning it on adds the streams of PIDs noted meanwhile.
+    pub(crate) fn grow_streams(&mut self, on: bool) {
+        self.grow_streams = on;
+        if on {
+            for (pid, params, stream_type) in std::mem::take(&mut self.noted) {
+                self.add_late_stream(pid, params, stream_type);
+            }
+        }
+    }
+
+    /// One packet of the PMT PID while demuxing: a section that differs
+    /// from the last one applied (skip_identical) is applied.
+    fn observe_pmt(&mut self, pkt: &TsPacket<'_>) {
+        if pkt.payload.is_empty() {
+            return;
+        }
+        let Ok(sections) =
+            self.pmt_assembler
+                .feed(pkt.payload, pkt.payload_unit_start, pkt.continuity_counter)
+        else {
+            return;
+        };
+        for section in sections {
+            let Ok(pmt) = ProgramMapTable::parse(&section) else {
+                continue;
+            };
+            if pmt.program_number != self.selected_program {
+                continue;
+            }
+            let key = (pmt.version_number, section_crc(&section));
+            if self.last_pmt == Some(key) {
+                continue;
+            }
+            self.last_pmt = Some(key);
+            self.apply_pmt(&pmt);
+        }
+    }
+
+    /// pmt_cb on a PMT met while demuxing. A PID it lists for the first
+    /// time gets a stream, in its order, from this PMT on. PIDs already
+    /// known keep their codec: the stream list is fixed at open.
+    fn apply_pmt(&mut self, pmt: &ProgramMapTable) {
+        let (order, mut identities) = pmt_identities(&pmt.streams, 1);
+        for pid in order {
+            let (es, language) = identities.remove(&pid).expect("listed");
+            if self.pid_to_stream.contains_key(&pid) {
+                self.inactive.remove(&pid);
+                continue;
+            }
+            if self.noted.iter().any(|(noted, ..)| *noted == pid) {
+                continue;
+            }
+            let Some(mut params) = es.params else {
+                continue;
+            };
+            if params.language.is_none() {
+                params.language = language;
+            }
+            if self.grow_streams {
+                self.add_late_stream(pid, params, es.stream_type);
+            } else {
+                self.noted.push((pid, params, es.stream_type));
+            }
+        }
+    }
+
+    /// A stream for `pid` from a later PMT version, live from now on.
+    fn add_late_stream(&mut self, pid: u16, params: CodecParameters, stream_type: u8) {
+        let index = self.streams.len() as u32;
+        let duration = self
+            .duration_micros
+            .map(|total| (total as i128 * 90_000 / 1_000_000) as i64);
+        self.streams.push(StreamInfo {
+            index,
+            time_base: TimeBase::new(1, 90_000),
+            duration,
+            start_time: None,
+            params,
+        });
+        self.pid_to_stream.insert(pid, index);
+        self.reassemblers.insert(pid, PesReassembler::new());
+        self.pts_trackers.insert(pid, PtsTracker::new());
+        self.dts_trackers.insert(pid, PtsTracker::new());
+        self.stream_types.insert(pid, stream_type);
+        self.late_pids.push(pid);
     }
 
     /// The PMT `stream_type` of stream `index`.
@@ -1814,6 +1928,42 @@ fn first_iso639_language(pmt_stream: &crate::PmtStream) -> Option<String> {
     None
 }
 
+/// pmt_cb over a PMT's entries, `passes` times: what each PID becomes,
+/// with its language, and the PIDs in the order they first appear. ISO
+/// 639 languages do not overwrite one already set
+/// (AV_DICT_DONT_OVERWRITE, mpegts.c:2280).
+#[allow(clippy::type_complexity)]
+fn pmt_identities(
+    entries: &[crate::PmtStream],
+    passes: usize,
+) -> (Vec<u16>, HashMap<u16, (EsCodec, Option<String>)>) {
+    let mut order = Vec::new();
+    let mut identities: HashMap<u16, (EsCodec, Option<String>)> = HashMap::new();
+    for entry in (0..passes).flat_map(|_| entries) {
+        let pid = entry.elementary_pid;
+        let prev = identities.get(&pid);
+        let es = pmt_entry_codec(prev.map(|(es, _)| es), entry);
+        let language = prev
+            .and_then(|(_, l)| l.clone())
+            .or_else(|| first_iso639_language(entry));
+        if prev.is_none() {
+            order.push(pid);
+        }
+        identities.insert(pid, (es, language));
+    }
+    (order, identities)
+}
+
+/// A PSI section's CRC_32 field.
+fn section_crc(section: &[u8]) -> u32 {
+    section
+        .len()
+        .checked_sub(4)
+        .and_then(|at| section.get(at..))
+        .and_then(|crc| crc.try_into().ok())
+        .map_or(0, u32::from_be_bytes)
+}
+
 /// What FFmpeg's pmt_cb has decided about one elementary PID.
 #[derive(Clone, Debug)]
 struct EsCodec {
@@ -1850,7 +2000,10 @@ impl EsCodec {
 /// EN 300 468 annex G) or the registrations `DTS1`/`DTS2`/`DTS3`; AC-3
 /// and E-AC-3 by the DVB AC-3 (0x6A) and enhanced AC-3 (0x7A) descriptors
 /// or the `AC-3` / `EAC3` registrations; stream type 0x87 is ATSC E-AC-3
-/// (MISC_types).
+/// (MISC_types). Opus is named by its `Opus` registration, timed ID3
+/// (and KLV) by a metadata descriptor while the codec is unknown
+/// (METADATA_types), and the DVB extension descriptor 0x7F with tag
+/// 0x80 then states the Opus channels (:2304-2336).
 fn pmt_entry_codec(prev: Option<&EsCodec>, entry: &crate::PmtStream) -> EsCodec {
     let mut es = match prev {
         Some(p) if p.stream_type == entry.stream_type => p.clone(),
@@ -1864,30 +2017,115 @@ fn pmt_entry_codec(prev: Option<&EsCodec>, entry: &crate::PmtStream) -> EsCodec 
     };
     let private = entry.stream_type == 0x06;
     for descriptor in entry.iter_descriptors().flatten() {
-        if es.params.is_some() && !es.probing {
-            break;
+        if es.params.is_none() || es.probing {
+            match descriptor_codec(&descriptor, private) {
+                Some(Some(params)) => {
+                    es.params = Some(params);
+                    es.probing = false;
+                    es.unsupported = false;
+                }
+                Some(None) => {
+                    es.params = None;
+                    es.probing = false;
+                    es.unsupported = true;
+                }
+                None => {}
+            }
         }
-        match descriptor_codec(&descriptor, private) {
-            Some(Some(params)) => {
-                es.params = Some(params);
-                es.probing = false;
-                es.unsupported = false;
+        match descriptor.tag {
+            0x26 if es.params.is_none() => {
+                if let Some(params) = metadata_codec(descriptor.data) {
+                    es.params = Some(params);
+                    es.probing = false;
+                }
             }
-            Some(None) => {
-                es.params = None;
-                es.probing = false;
-                es.unsupported = true;
+            0x7F => {
+                if let Some(params) = es.params.as_mut() {
+                    opus_channel_config(params, descriptor.data);
+                }
             }
-            None => {}
+            _ => {}
         }
     }
     es
+}
+
+/// METADATA_DESCRIPTOR: the metadata_format_identifier (when the format
+/// is 0xFF) looked up in METADATA_types.
+fn metadata_codec(data: &[u8]) -> Option<CodecParameters> {
+    let mut at = 2;
+    if data.get(..2)? == [0xFF, 0xFF] {
+        at += 4;
+    }
+    if *data.get(at)? != 0xFF {
+        return None;
+    }
+    let name = match data.get(at + 1..at + 5)? {
+        b"KLVA" => "smpte_klv",
+        b"ID3 " => "timed_id3",
+        _ => return None,
+    };
+    let mut params = CodecParameters::audio(CodecId::new(name));
+    params.media_type = oxideav_core::MediaType::Data;
+    Some(params)
+}
+
+/// opus_coupled_stream_cnt, opus_stream_cnt and opus_channel_map
+/// (libavformat/mpegts.c:1884-1901).
+const OPUS_COUPLED_STREAMS: [u8; 9] = [1, 0, 1, 1, 2, 2, 2, 3, 3];
+const OPUS_STREAMS: [u8; 9] = [1, 1, 1, 2, 2, 3, 4, 4, 5];
+const OPUS_CHANNEL_MAP: [&[u8]; 8] = [
+    &[0],
+    &[0, 1],
+    &[0, 2, 1],
+    &[0, 1, 2, 3],
+    &[0, 4, 1, 2, 3],
+    &[0, 4, 1, 2, 3, 5],
+    &[0, 4, 1, 2, 3, 5, 6],
+    &[0, 6, 1, 2, 3, 4, 5, 7],
+];
+
+/// The DVB extension descriptor with tag 0x80 (provisional Opus) on an
+/// Opus stream without extradata: the OpusHead FFmpeg builds from its
+/// channel_config_code (opus_default_extradata, mpegts.c:2308-2335).
+fn opus_channel_config(params: &mut CodecParameters, data: &[u8]) {
+    if params.codec_id.as_str() != "opus" || !params.extradata.is_empty() {
+        return;
+    }
+    let (Some(&0x80), Some(&code)) = (data.first(), data.get(1)) else {
+        return;
+    };
+    let mut head = Vec::with_capacity(29);
+    head.extend_from_slice(b"OpusHead\x01");
+    if code > 8 {
+        // avpriv_request_sample: the default extradata, no channels.
+        head.resize(30, 0);
+        params.extradata = head;
+        return;
+    }
+    let channels = if code == 0 { 2 } else { code };
+    head.push(channels);
+    head.extend_from_slice(&[0, 0]);
+    head.extend_from_slice(&48_000u32.to_le_bytes());
+    head.extend_from_slice(&[0, 0]);
+    let family = if code == 0 { 255 } else { u8::from(channels > 2) };
+    head.push(family);
+    if family != 0 {
+        head.push(OPUS_STREAMS[code as usize]);
+        head.push(OPUS_COUPLED_STREAMS[code as usize]);
+        head.extend_from_slice(OPUS_CHANNEL_MAP[channels as usize - 1]);
+    }
+    params.extradata = head;
+    params.channels = Some(u16::from(channels));
+    params.sample_rate = Some(48_000);
 }
 
 /// The codec a stream type names (ISO, HDMV and MISC types).
 fn stream_type_codec(stream_type: u8) -> Option<CodecParameters> {
     match stream_type {
         0x87 => Some(CodecParameters::audio(CodecId::new("eac3"))),
+        0x33 => Some(CodecParameters::video(CodecId::new("vvc"))),
+        0x36 => Some(CodecParameters::video(CodecId::new("lcevc"))),
         0x06 => None,
         st => codec_params_for_stream_type(st),
     }
@@ -1907,6 +2145,7 @@ fn descriptor_codec(
             [b'D', b'T', b'S', b'1'..=b'3'] => audio("dts"),
             b"AC-3" => audio("ac3"),
             b"EAC3" => audio("eac3"),
+            b"Opus" => audio("opus"),
             _ => None,
         },
         _ if !private => None,
