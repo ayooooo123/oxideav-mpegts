@@ -474,6 +474,12 @@ impl MpegTsDemuxer {
                 }
                 None => continue,
             };
+            // In a Blu-ray program 0x80 is LPCM whose packets carry their
+            // own header (HDMV_types, mpegts_set_stream_info,
+            // mpegts.c:976-979; ISO_types have no 0x80).
+            if hdmv && es.stream_type == 0x80 {
+                params.codec_id = CodecId::new("pcm_bluray");
+            }
             // Lift the ES_info ISO_639_language_descriptor (tag 0x0A,
             // §2.6.18) into the per-stream language tag so a demux →
             // remux path keeps each track's audio/subtitle language.
@@ -2618,6 +2624,60 @@ mod tests {
         // EOF after flush — single packet stream.
         let next = dmx.next_packet();
         assert!(matches!(next, Err(CoreError::Eof)));
+    }
+
+    /// One program whose PMT carries `program_info` and a stream type 0x80
+    /// PES (private stream 1) holding a Blu-ray LPCM packet: the 4-byte
+    /// header (stereo, 48 kHz, 16-bit) and two sample frames.
+    fn synth_lpcm_ts(program_info: &[u8]) -> Vec<u8> {
+        fn packet(pid: u16, payload: &[u8], psi: bool) -> [u8; TS_PACKET_LEN] {
+            let mut pkt = [0xFFu8; TS_PACKET_LEN];
+            pkt[..4].copy_from_slice(&[TS_SYNC_BYTE, 0x40 | (pid >> 8) as u8, pid as u8, 0x10]);
+            let off = if psi {
+                pkt[4] = 0;
+                5
+            } else {
+                4
+            };
+            pkt[off..off + payload.len()].copy_from_slice(payload);
+            pkt
+        }
+        let mut pat = vec![0x00, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xE1, 0x00];
+        pat.extend_from_slice(&crc32_mpeg2(&pat).to_be_bytes());
+        let section_length = 9 + program_info.len() + 5 + 4;
+        let mut pmt = vec![0x02, 0xB0, section_length as u8, 0x00, 0x01, 0xC1, 0x00, 0x00, 0xE1, 0x01];
+        pmt.extend_from_slice(&[0xF0, program_info.len() as u8]);
+        pmt.extend_from_slice(program_info);
+        pmt.extend_from_slice(&[0x80, 0xE1, 0x01, 0xF0, 0x00]);
+        pmt.extend_from_slice(&crc32_mpeg2(&pmt).to_be_bytes());
+        let lpcm = [0x00, 0x08, 0x31, 0x40, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let mut pes = vec![0x00, 0x00, 0x01, 0xBD, 0x00, (3 + 5 + lpcm.len()) as u8, 0x80, 0x80, 0x05];
+        pes.extend_from_slice(&[0x21, 0x00, 0x01, 0x00, 0x01]);
+        pes.extend_from_slice(&lpcm);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&packet(0x0000, &pat, true));
+        buf.extend_from_slice(&packet(0x0100, &pmt, true));
+        buf.extend_from_slice(&packet(0x0101, &pes, false));
+        buf
+    }
+
+    /// In a Blu-ray program (registration `HDMV` or `HDPR`), stream type
+    /// 0x80 is `pcm_bluray`, whose packets start with their own header
+    /// (FFmpeg's HDMV_types, mpegts.c:976-979); elsewhere it stays the
+    /// plain big-endian PCM the type table names.
+    #[test]
+    fn hdmv_lpcm_is_pcm_bluray() {
+        for (program_info, codec) in [
+            (&[0x05, 4, b'H', b'D', b'M', b'V'][..], "pcm_bluray"),
+            (&[0x05, 4, b'H', b'D', b'P', b'R'][..], "pcm_bluray"),
+            (&[][..], "pcm_s16be"),
+        ] {
+            let cursor: Box<dyn ReadSeek> = Box::new(Cursor::new(synth_lpcm_ts(program_info)));
+            let mut dmx = MpegTsDemuxer::new(cursor).expect("open");
+            assert_eq!(dmx.streams()[0].params.codec_id.as_str(), codec, "program_info {program_info:02x?}");
+            let pkt = dmx.next_packet().expect("the LPCM packet");
+            assert_eq!(pkt.data[..4], [0x00, 0x08, 0x31, 0x40], "the packet keeps its LPCM header");
+        }
     }
 
     /// Build a sequence of TS packets carrying `section` on `pid`,

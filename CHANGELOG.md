@@ -11,6 +11,10 @@ format is loosely based on [Keep a Changelog] and the crate adheres to
 
 ### Added
 
+- In a Blu-ray program (registration `HDMV` or `HDPR`), stream type 0x80
+  is `pcm_bluray` (FFmpeg's HDMV_types), whose packets carry a 4-byte
+  header; it was `pcm_s16be`, which a PCM decoder refused or read with the
+  header as samples. Without that registration 0x80 stays `pcm_s16be`.
 - The registry's `mpegts` demuxer (`open`) is now `ParsedDemuxer`: every
   PES goes through FFmpeg 2da55bf's parser stage, ported under LGPL-2.1-or-
   later in `src/ff/` and `src/parsed.rs`. H.264, MPEG-1/2 video, MPEG
